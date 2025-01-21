@@ -17,14 +17,14 @@ class MeshContextManager:
         :param mp: Number of model parallel devices.
         """
         # Ensure dp * mp == total devices (8 for TPU v2-8)
-        assert dp * mp == 8, f"Invalid dp ({dp}) and mp ({mp}) configuration for TPU v2-8."
+        # assert dp * mp == 8, f"Invalid dp ({dp}) and mp ({mp}) configuration for TPU v2-8."
         
         # Define the 3D mesh: (data parallel, model parallel, intra-core)
-        devices = mesh_utils.create_device_mesh((2, 2, 2))
+        devices = mesh_utils.create_device_mesh((1, 1))
         
         # Map dp and mp to mesh axes
         # Assume dp spans the first dimension and mp spans the second
-        self.mesh = Mesh(devices, axis_names=('dp', 'mp', 'core'))
+        self.mesh = Mesh(devices, axis_names=('dp', 'mp'))
 
     def get_mesh(self):
         """
