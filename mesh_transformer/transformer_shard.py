@@ -195,11 +195,12 @@ class CausalTransformer:
         print(f"Keys passed to shard_map: {rng.shape}")  # Debug
         
         self.init_shmap = jax.jit(shard_map(
-            vmapped_fn,  # Use the vmapped version of the function
-            in_specs=(P('core', 'mp'), P('dp')),  # Adjust to the 3D mesh axes
-            out_specs=(P('core', 'mp'), P('dp')),  
+            vmapped_fn,
+            in_specs=(P() if jax.device_count() == 1 else P('core', 'mp'), P()),  
+            out_specs=(P() if jax.device_count() == 1 else P('core', 'mp'), P()),  
             mesh=mesh_manager.get_mesh()
         ))
+
 
         x = jnp.zeros((self.config["seq"], 1), dtype=jnp.uint32)  # Reduce the batch size to match mp
         self.init_shmap(rng, x)  # Trigger the initialization process
