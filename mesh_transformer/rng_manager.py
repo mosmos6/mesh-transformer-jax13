@@ -10,15 +10,13 @@ class RNGManager:
         self.current_rng = self.base_rng
 
     def split_keys(self, num_splits):
-        """
-        Split the current RNG into multiple sub-keys.
-        """
-        # Use self.base_rng to generate the splits
-        split_keys = jax.random.split(self.base_rng, num_splits)
-        # Update the base_rng to the next key in the sequence
-        self.base_rng = jax.random.fold_in(self.base_rng, 1)  # Advance base key  
-        print(f"split_keys output shape: {split_keys.shape}")  # Debug
-        return split_keys
+        if jax.device_count() == 1:
+            return self.base_rng  # Use single key when there's only one device
+        else:
+            split_keys = jax.random.split(self.base_rng, num_splits)
+            self.base_rng = split_keys[0]  # Update base_rng to the next key in sequence
+            return split_keys
+
 
     def get_current_key(self):
         """
