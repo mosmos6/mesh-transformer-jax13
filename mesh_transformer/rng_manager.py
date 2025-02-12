@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 
 class RNGManager:
-    def __init__(self, seed=0):
+    def __init__(self, seed=42):
         """
         Initialize the RNGManager with a base seed.
         """
