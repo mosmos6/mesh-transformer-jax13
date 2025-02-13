@@ -179,9 +179,11 @@ class CausalTransformer:
             model_output = model.init(rng, x)
             return model_output, self.state
 
-        # Apply vmap to batch over the function, then pass to shard_map
-        vmapped_fn = jax.vmap(init_fn, in_axes=(0, None))  # Vmap over the first axis of rng, but not x
-        
+        if jax.device_count() > 1:
+            vmapped_fn = jax.vmap(init_fn, in_axes=(0, None))  # Vmap RNG over multiple devices
+        else:                
+            vmapped_fn = init_fn  # No need to vmap on a single core
+
         print(mesh_manager.get_mesh())
 
         # Split the key for the total number of devices
