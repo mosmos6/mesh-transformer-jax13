@@ -186,7 +186,7 @@ class CausalTransformer:
 
         print(f"Using {'vmap' if jax.device_count() > 1 else 'direct'} execution for init_fn.")
         # Initialize state with shard_map
-        print(f"Keys passed to shard_map: {rng.shape}")  # Should print (2,) in single-core mode
+        # print(f"Keys passed to shard_map: {rng.shape}")  # Should print (2,) in single-core mode
 
         print(mesh_manager.get_mesh())
 
