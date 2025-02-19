@@ -217,7 +217,12 @@ class EmbeddingShard(nn.Module):
         self.proj = nn.Dense(self.out_dim, kernel_init=nn.initializers.truncated_normal(stddev=1 / np.sqrt(in_dim)))
 
     def __call__(self, x, dtype=jnp.bfloat16):
-        shard_start_index = jax.lax.axis_index('mp') * self.in_dim_per_shard
+        # shard_start_index = jax.lax.axis_index('mp') * self.in_dim_per_shard
+        if "mp" in mesh.axis_names:
+            shard_start_index = jax.lax.axis_index('mp') * self.in_dim_per_shard
+        else:
+            shard_start_index = 0  # No model parallelism in single-core mode
+
 
         # Use one-hot encoding for input
         input_onehot = jax.nn.one_hot(x - shard_start_index, self.in_dim_per_shard)
