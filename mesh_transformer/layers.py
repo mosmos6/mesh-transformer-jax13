@@ -237,9 +237,12 @@ class EmbeddingShard(nn.Module):
 
         # Apply positional embeddings if available
         if self.positional_embeddings is not None:
-            print(f"Before all_pos_embed with all_gather - x shape: {x.shape}")
-            all_pos_embed = jax.lax.all_gather(self.positional_embeddings, 'mp')
-            print(f"After all_pos_embed with all_gather - x shape: {x.shape}")
+            print(f"Before all_pos_embed - x shape: {x.shape}")
+            if "mp" in self.mesh.axis_names:                
+                all_pos_embed = jax.lax.all_gather(self.positional_embeddings, 'mp')
+                print(f"After all_gather - x shape: {x.shape}")
+            else:
+                all_pos_embed = self.positional_embeddings  # No gathering needed in single-core mode
 
             # Flatten and transpose like original GPT-J
             all_pos_embed = jnp.transpose(all_pos_embed, (1, 0, 2)).reshape(self.config["seq"], -1)
@@ -250,9 +253,10 @@ class EmbeddingShard(nn.Module):
 
 
 class TransformerLayerShard(nn.Module):
-    config: dict
-    mesh_manager: MeshContextManager
-    init_scale: float = 1.0
+    def __init__(self, config, mesh):
+        super().__init__()
+        self.config = config
+        self.mesh = mesh  # Store mesh for checking axis names dynamically
 
     def setup(self):
         self.n_heads = self.config["n_heads"]
@@ -466,6 +470,7 @@ class Projection(nn.Module):
         correct = (0.0 == predicted_logits)
         return loss, correct
 
-
-def compute_shard_start_index(dim_per_shard):
-    return jax.lax.axis_index('mp') * dim_per_shard
+def compute_shard_start_index(dim_per_shard, mesh):
+    if "mp" in mesh.axis_names:
+        return jax.lax.axis_index('mp') * dim_per_shard
+    return 0  # No sharding in single-core mode
