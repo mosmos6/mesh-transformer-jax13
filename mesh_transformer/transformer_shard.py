@@ -36,7 +36,7 @@ class CausalTransformerShard(nn.Module):
         self.n_heads = self.config["n_heads"]
         self.heads_per_shard = self.n_heads // self.config["cores_per_replica"]
         self.transformer_layers = [
-            TransformerLayerShard(config=self.config, mesh_manager=self.mesh_manager, mesh=self.mesh_manager.get_mesh()) 
+            TransformerLayerShard(config=self.config, mesh=self.mesh_manager.get_mesh()) 
             for _ in range(self.layers)
         ]
 
