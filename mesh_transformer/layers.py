@@ -252,11 +252,10 @@ class EmbeddingShard(nn.Module):
         return proj_out
 
 
+
 class TransformerLayerShard(nn.Module):
-    def __init__(self, config, mesh):
-        super().__init__()
-        self.config = config
-        self.mesh = mesh  # Store mesh for checking axis names dynamically
+    config: dict
+    mesh: object  # Flax will recognize this as a parameter
 
     def setup(self):
         self.n_heads = self.config["n_heads"]
