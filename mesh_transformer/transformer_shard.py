@@ -31,12 +31,13 @@ class CausalTransformerShard(nn.Module):
     rng_manager: object  # Add RNGManager as a dependency
 
     def setup(self):
+        self.mesh = self.mesh_manager.get_mesh()  # Store mesh instance
         self.layers = self.config["layers"]
         self.d_model = self.config["d_model"]
         self.n_heads = self.config["n_heads"]
         self.heads_per_shard = self.n_heads // self.config["cores_per_replica"]
         self.transformer_layers = [
-            TransformerLayerShard(config=self.config, mesh=self.mesh_manager.get_mesh()) 
+            TransformerLayerShard(config=self.config, mesh=self.mesh) 
             for _ in range(self.layers)
         ]
 
