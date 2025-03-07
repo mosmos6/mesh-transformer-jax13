@@ -43,7 +43,7 @@ class CausalTransformerShard(nn.Module):
 
                 
         #self.embed = nn.Embed(self.config["n_vocab"], self.d_model)
-        self.embed = EmbeddingShard(config=self.config)
+        self.embed = EmbeddingShard(config=self.config, mesh=self.mesh_manager.get_mesh())  # ✅ Correct way
         self.proj = ProjectionShard(config=self.config)
         # Use the state provided during initialization
         self.state = self.init_state
