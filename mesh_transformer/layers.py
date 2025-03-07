@@ -195,7 +195,7 @@ def apply_rotary_pos_emb(x, sincos):
 
 class EmbeddingShard(nn.Module):
     config: dict
-    mesh: Mesh
+    mesh: object
 
     def setup(self):
         in_dim = self.config["n_vocab"]
