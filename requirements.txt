@@ -9,7 +9,7 @@ keras~=2.15.0
 tensorboard~=2.15.0 # changed on 28march
 tensorflow-estimator
 jinja2~=3.0.0
-typing-extensions~=4.5.0
+typing-extensions
 google-api-core[grpc]
 fabric~=2.6.0
 optax==0.1.9
