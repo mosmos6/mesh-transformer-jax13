@@ -216,7 +216,8 @@ class EmbeddingShard(nn.Module):
             self.positional_embeddings = None
 
         self.proj = nn.Dense(self.out_dim, kernel_init=nn.initializers.truncated_normal(stddev=1 / np.sqrt(in_dim)))
-
+        self.embed_layer = nn.Embed(self.config["n_vocab"], self.config["d_model"])
+    
     def __call__(self, x, dtype=jnp.bfloat16):
         # shard_start_index = jax.lax.axis_index('mp') * self.in_dim_per_shard
         if "mp" in self.mesh.axis_names:
