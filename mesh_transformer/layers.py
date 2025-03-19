@@ -225,7 +225,7 @@ class EmbeddingShard(nn.Module):
         else:
             shard_start_index = 0  # No model parallelism in single-core mode
 
-        return self.embed(x)
+        return self.embed_layer(x)
 
 
         # Use one-hot encoding for input
