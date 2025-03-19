@@ -260,6 +260,7 @@ class EmbeddingShard(nn.Module):
 class TransformerLayerShard(nn.Module):
     config: dict
     mesh: object  # Flax will recognize this as a parameter
+    init_scale: float = 1.0
 
     def setup(self):
         self.n_heads = self.config["n_heads"]
