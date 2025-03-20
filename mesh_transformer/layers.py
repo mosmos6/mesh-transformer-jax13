@@ -28,9 +28,11 @@ class ReplicatedLayerNorm(nn.Module):
 
         print(f"Before all_gather in ReplicatedLayerNorm - scale shape: {scale.shape}, offset shape: {offset.shape}")
 
-        # Replace with g_psum for psum in forward pass only
-        scale = jax.lax.all_gather(scale, "mp")[0]
-        offset = jax.lax.all_gather(offset, "mp")[0]
+        model_axis = "mp" if "mp" in self.mesh.axis_names else "single_core"
+
+        print(f"Applying all_gather on axis: {model_axis}")  # Debug
+        scale = jax.lax.all_gather(scale, model_axis)[0]
+        offset = jax.lax.all_gather(offset, model_axis)[0]
 
         print(f"After all_gather in ReplicatedLayerNorm - scale shape: {scale.shape}, offset shape: {offset.shape}")
 
