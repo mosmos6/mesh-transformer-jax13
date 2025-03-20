@@ -16,6 +16,7 @@ from flax.linen import remat
 
 class ReplicatedLayerNorm(nn.Module):
     offset: bool = True
+    mesh: object
 
     @nn.compact
     def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
