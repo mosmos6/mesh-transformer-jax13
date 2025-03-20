@@ -15,6 +15,7 @@ from flax.linen import remat
 
 
 class ReplicatedLayerNorm(nn.Module):
+    mesh: object
     offset: bool = True
 
     @nn.compact
@@ -28,7 +29,11 @@ class ReplicatedLayerNorm(nn.Module):
 
         print(f"Before all_gather in ReplicatedLayerNorm - scale shape: {scale.shape}, offset shape: {offset.shape}")
 
-        model_axis = "mp" if "mp" in self.mesh.axis_names else "single_core"
+        # ✅ Ensure self.mesh exists and use the correct axis
+        if hasattr(self, "mesh") and hasattr(self.mesh, "axis_names"):
+            model_axis = "mp" if "mp" in self.mesh.axis_names else "single_core"
+        else:
+            raise ValueError("Mesh context is not available in ReplicatedLayerNorm.")
 
         print(f"Applying all_gather on axis: {model_axis}")  # Debug
         scale = jax.lax.all_gather(scale, model_axis)[0]
