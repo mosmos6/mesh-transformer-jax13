@@ -274,7 +274,7 @@ class TransformerLayerShard(nn.Module):
         self.dim = self.config["d_model"]
         self.dim_per_head = self.dim // self.n_heads
         self.shards = self.config["cores_per_replica"]
-        self.norm = getnorm(self.config["norm"])
+        self.norm = getnorm(self.config["norm"], mesh=self.mesh)
         self.is_rotary = self.config["pe"] == "rotary"
         self.qvk_proj_layer = nn.Dense(3 * self.n_heads * self.dim_per_head, use_bias=False)
 
@@ -415,7 +415,7 @@ class ProjectionShard(nn.Module):
         self.dim_per_shard = self.config.get("dim_per_shard", self.dim // self.shards)
         self.out_dim = self.config["d_model"]
         self.mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(self.shards, -1), ("dp", "mp"))
-        self.layer_norm = getnorm(self.config["norm"])
+        self.layer_norm = getnorm(self.config["norm"], mesh=self.mesh)
         self.dense = nn.Dense(self.out_dim)
 
     def loss(self, x, target, shard_start_index, z_loss):
@@ -456,7 +456,7 @@ class Projection(nn.Module):
 
     def setup(self):
         self.dim = self.config["n_vocab"]
-        self.norm = getnorm(self.config["norm"])
+        self.norm = getnorm(self.config["norm"], mesh=self.mesh)
         self.proj = nn.Dense(self.dim)
 
     def __call__(self, x):
