@@ -75,11 +75,11 @@ class RMSNorm(nn.Module):
 
 def getnorm(type):
     if type == "layernorm":
-        return ReplicatedLayerNorm(mesh)
+        return ReplicatedLayerNorm(mesh=mesh)
     if type == "layernorm-desync":
         return nn.LayerNorm()
     elif type == "layernorm-nobias":
-        return ReplicatedLayerNorm(offset=False, mesh)
+        return ReplicatedLayerNorm(offset=False, mesh=mesh)
     elif type == "rmsnorm":
         return RMSNorm(False, True)
     elif type == "scalenorm":
