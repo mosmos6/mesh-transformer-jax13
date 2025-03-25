@@ -89,8 +89,8 @@ def to_f16(t):
 
 # identity in forward pass, psum in backward
 @jax.custom_vjp
-def f_psum(x):
-    axis_name = "mp"  # Define axis_name here to avoid passing as a parameter
+def f_psum(x, mesh_axes=("mp",)):
+    axis_name = "mp" if "mp" in mesh_axes else "single_core"
     reduce_to_first = False  # Set directly as a boolean
     result = x
     if reduce_to_first:
