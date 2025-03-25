@@ -138,8 +138,8 @@ f_pmean.defvjp(f_pmean_fwd, f_pmean_bwd)
 
 # psum in forward pass, identity in backward
 @jax.custom_vjp
-def g_psum(x):
-    axis_name = "mp"  # Define axis_name here to avoid passing as a parameter
+def g_psum(x, mesh_axes=("mp",)):
+    axis_name = "mp" if "mp" in mesh_axes else "single_core"
     reduce_to_first = False  # Set directly as a boolean
     result = jax.lax.psum(x, axis_name)
     if reduce_to_first:
