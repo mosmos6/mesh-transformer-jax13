@@ -114,7 +114,7 @@ def f_psum_first_fwd(x):
     return f_psum_first(x), None
 
 def f_psum_first_bwd(_, g):
-    axis_name = "mp"
+    axis_name = "mp" if "mp" in mesh_axes else "single_core"
     return jax.lax.psum(g, axis_name),
 
 f_psum_first.defvjp(f_psum_first_fwd, f_psum_first_bwd)
