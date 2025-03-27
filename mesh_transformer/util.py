@@ -165,7 +165,7 @@ def g_psum_first_fwd(x):
     return g_psum_first(x), None
 
 def g_psum_first_bwd(_, g):
-    axis_name = "mp"  # Define axis_name for backward calculation
+    axis_name = "mp" if "mp" in mesh_axes else "single_core"
     return jax.lax.psum(g, axis_name),
 
 g_psum_first.defvjp(g_psum_first_fwd, g_psum_first_bwd)
