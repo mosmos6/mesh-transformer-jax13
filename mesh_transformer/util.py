@@ -130,7 +130,8 @@ def f_pmean_fwd(x):
 
 
 def f_pmean_bwd(_, g):
-    return jax.lax.pmean(g, "mp"),
+    axis_name = "mp" if "mp" in mesh_axes else "single_core"
+    return jax.lax.pmean(g, axis_name),
 
 
 f_pmean.defvjp(f_pmean_fwd, f_pmean_bwd)
