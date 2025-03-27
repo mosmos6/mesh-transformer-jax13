@@ -151,7 +151,7 @@ def g_psum_fwd(x):
     return g_psum(x), None
 
 def g_psum_bwd(_, g):
-    axis_name = "mp"  # Define axis_name here for backward calculation
+    axis_name = "mp" if "mp" in mesh_axes else "single_core"
     return jax.lax.psum(g, axis_name),
 
 g_psum.defvjp(g_psum_fwd, g_psum_bwd)
