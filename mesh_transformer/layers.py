@@ -35,6 +35,8 @@ class ReplicatedLayerNorm(nn.Module):
         else:
             raise ValueError("Mesh context is not available in ReplicatedLayerNorm.")
 
+        model_axis = "mp" if "mp" in self.mesh.axis_names else "single_core"
+        
         print(f"Applying all_gather on axis: {model_axis}")  # Debug
         scale = jax.lax.all_gather(scale, model_axis)[0]
         offset = jax.lax.all_gather(offset, model_axis)[0]
