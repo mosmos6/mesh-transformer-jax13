@@ -15,7 +15,7 @@ from flax.linen import remat
 
 
 class ReplicatedLayerNorm(nn.Module):
-    mesh: Mesh
+    mesh: object
     offset: bool = True
 
     @nn.compact
