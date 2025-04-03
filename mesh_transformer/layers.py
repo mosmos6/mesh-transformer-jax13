@@ -410,13 +410,14 @@ class TransformerLayerShard(nn.Module):
 
 class ProjectionShard(nn.Module):
     config: dict
+    mesh: object
 
     def setup(self):
         self.dim = self.config["d_model"]
         self.shards = self.config["cores_per_replica"]
         self.dim_per_shard = self.config.get("dim_per_shard", self.dim // self.shards)
         self.out_dim = self.config["d_model"]
-        self.mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(self.shards, -1), ("dp", "mp"))
+        # self.mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(self.shards, -1), ("dp", "mp")) # mesh is already passed into the module
         self.layer_norm = getnorm(self.config["norm"], mesh=self.mesh)
         self.dense = nn.Dense(self.out_dim)
 
