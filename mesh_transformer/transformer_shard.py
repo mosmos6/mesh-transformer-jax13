@@ -212,7 +212,7 @@ class CausalTransformer:
         ))
 
 
-        x = jnp.zeros((self.config["seq"], 1), dtype=jnp.uint16)  # Reduce the batch size to match mp
+        x = jnp.zeros((self.config["seq"], 1), dtype=jnp.uint32)  # Reduce the batch size to match mp
         self.init_shmap(rng, x)  # Trigger the initialization process
         print("init shmap done")
 
