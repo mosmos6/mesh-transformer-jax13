@@ -8,6 +8,7 @@ from jax.experimental import mesh_utils
 from jax.sharding import Mesh, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
 import flax.linen as nn
+from flax.linen import remat
 import jax
 import jax.numpy as jnp
 import optax
