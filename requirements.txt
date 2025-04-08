@@ -15,6 +15,7 @@ fabric
 optax
 dm-haiku
 ray[default]
+ray
 jax
 jaxlib
 Flask
