@@ -1,7 +1,7 @@
 import os
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1 --xla_gpu_force_compilation_parallelism=1'
-print("xla flags done") 
+# os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+# os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1 --xla_gpu_force_compilation_parallelism=1'
+# print("xla flags done") 
 
 from functools import partial
 from jax.experimental import mesh_utils
