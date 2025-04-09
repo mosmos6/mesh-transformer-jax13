@@ -1,5 +1,6 @@
 import os
-# os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Allows dynamic allocations
 # os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1 --xla_gpu_force_compilation_parallelism=1'
 # print("xla flags done") 
 
