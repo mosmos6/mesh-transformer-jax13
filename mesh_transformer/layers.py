@@ -442,6 +442,7 @@ class ProjectionShard(nn.Module):
 
         return -(softmax_logits.mean() + z_loss_penalty), jnp.argmax(logits, axis=-1) == target
 
+    @nn.remat
     def forward(self, x):
         x = self.layer_norm(x)
         print(f"After forward layer_norm - x shape: {x.shape}")
@@ -466,6 +467,7 @@ class Projection(nn.Module):
         x = self.norm(x)
         return self.proj(x)
 
+    @nn.remat
     def loss(self, x, targets, z_loss=1):
         x = self.norm(x)
         logits = self.proj(x)
