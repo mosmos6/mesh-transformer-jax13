@@ -292,8 +292,8 @@ class TransformerLayerShard(nn.Module):
         self.v = nn.Dense(self.n_heads * self.dim_per_head, use_bias=False)
         self.k = nn.Dense(self.n_heads * self.dim_per_head, use_bias=False)
         self.o = nn.Dense(self.dim, use_bias=False, kernel_init=nn.initializers.truncated_normal(stddev=self.init_scale / np.sqrt(self.dim)))
-        self.dense_proj = nn.Dense(self.dim * 4)
-        self.dense_proj_o = nn.Dense(self.dim, kernel_init=nn.initializers.truncated_normal(stddev=self.init_scale / np.sqrt(self.dim)))
+        self.dense_proj = nn.Dense(self.dim * 4, dtype=jnp.bfloat16)
+        self.dense_proj_o = nn.Dense(self.dim, kernel_init=nn.initializers.truncated_normal(stddev=self.init_scale / np.sqrt(self.dim)), dtype=jnp.bfloat16)
 
     @nn.remat
     def self_attn(self, q, v, k, attn_bias=None):
@@ -419,7 +419,7 @@ class ProjectionShard(nn.Module):
         self.out_dim = self.config["d_model"]
         # self.mesh = jax.sharding.Mesh(np.array(jax.devices()).reshape(self.shards, -1), ("dp", "mp")) # mesh is already passed into the module
         self.layer_norm = getnorm(self.config["norm"], mesh=self.mesh)
-        self.dense = nn.Dense(self.out_dim)
+        self.dense = nn.Dense(self.out_dim, dtype=jnp.bfloat16)
 
     def loss(self, x, target, shard_start_index, z_loss):
         logits = self.forward(x)
