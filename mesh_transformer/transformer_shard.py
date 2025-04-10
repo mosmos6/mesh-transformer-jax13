@@ -46,7 +46,7 @@ class CausalTransformerShard(nn.Module):
                 
         #self.embed = nn.Embed(self.config["n_vocab"], self.d_model)
         self.embed = EmbeddingShard(config=self.config, mesh=self.mesh_manager.get_mesh())  # ✅ Correct way
-        self.proj = remat(ProjectionShard)(config=self.config, mesh=self.mesh)
+        self.proj = nn.remat(ProjectionShard)(config=self.config, mesh=self.mesh)
         # Use the state provided during initialization
         self.state = self.init_state
         print(f"State received during initialization with shape: {self.state.shape}")  # Debug: State shape
