@@ -206,7 +206,6 @@ class CausalTransformer:
         print(f"Keys passed to shard_map: {rng.shape}")  # Debug
         
         self.init_shmap = jax.jit(shard_map(
-            vmapped_fn,
             in_specs=(P() if jax.device_count() == 1 else P('core', 'mp'), P()),  
             out_specs=(P() if jax.device_count() == 1 else P('core', 'mp'), P()),  
             mesh=mesh_manager.get_mesh()
