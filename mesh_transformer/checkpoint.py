@@ -137,7 +137,9 @@ def read_ckpt(pytree, dir, shards_in, shards_out=None, load_opt=True):
 
     old_flattened, structure = jax.tree_util.tree_flatten(pytree)
 
-    original_opt_state = pytree["opt_state"]
+    #original_opt_state = pytree["opt_state"]
+    original_opt_state = pytree.get("opt_state", {})
+
 
     # TODO: figure out how to use a process pool here for more speed
     with multiprocessing.pool.ThreadPool(shards_in) as p:
