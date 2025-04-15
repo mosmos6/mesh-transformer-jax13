@@ -229,7 +229,7 @@ def read_ckpt_lowmem(pytree, dir, shards_in, shards_out=None, load_opt=True):
         unsharded = _unshard()
     except AssertionError:
         load_opt = False  # no opt to load in ckpt
-        #del pytree['opt_state']
+        del pytree['opt_state']
         old_flattened, structure = jax.tree_util.tree_flatten(pytree)
         unsharded = _unshard()
 
