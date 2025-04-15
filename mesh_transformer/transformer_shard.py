@@ -302,7 +302,7 @@ class CausalTransformer:
             final_state, outputs = jax.lax.scan(generate_scan_fn, initial_state, xs=aux, length=gen_length)
             return final_state, outputs
 
-        generate_fn = nn.compact(generate_sample).apply
+        generate_fn = nn.compact(generate_sample)
         # Get a new RNG key from RNGManager
         key = self.rng_manager.get_current_key()
         aux = jnp.zeros((ctx.shape[0], gen_length), dtype=jnp.uint32)
