@@ -285,7 +285,10 @@ class CausalTransformer:
 
     def generate(self, ctx, ctx_length, gen_length, sampler_options, return_logits=False):
         def generate_sample(context, ctx_length, aux):
-            transformer = CausalTransformerShard(self.config)
+            transformer = CausalTransformerShard(config=self.config,
+                                                 mesh_manager=self.mesh_manager,
+                                                 init_state=self.state,
+                                                 rng_manager=self.rng_manager)
             _, initial_state = transformer.generate_initial(context, ctx_length)
 
             def generate_scan_fn(carry, sampler_input):
