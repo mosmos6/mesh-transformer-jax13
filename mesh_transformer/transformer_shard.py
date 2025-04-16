@@ -154,6 +154,24 @@ class CausalTransformerShard(nn.Module):
         return self.proj(x), new_states
 
 
+    def generate_fn(self, context, ctx_length, aux, gen_length, sampler_options, return_logits=False):
+        _, initial_state = self.generate_initial(context, ctx_length)
+
+        def generate_scan_fn(carry, sampler_input):
+            next_token, decode_state, sample_key = carry
+            sample_key, new_key = jax.random.split(sample_key)
+    
+            logits, new_state = self.generate_once(next_token, decode_state)
+            next_token, sample_info = self.config["sampler"](sample_key, logits, sampler_input, **sampler_options)
+    
+            output = (next_token, sample_info, logits) if return_logits else (next_token, sample_info)
+            new_carry = (next_token, new_state, new_key)
+            return new_carry, output
+
+        final_state, outputs = jax.lax.scan(generate_scan_fn, initial_state, xs=aux, length=gen_length)
+        return final_state, outputs
+
+
 
 
 class CausalTransformer:
@@ -286,33 +304,31 @@ class CausalTransformer:
         return eval_loss(to_bf16(self.state["params"]), ctx, tgt, mask)
 
     def generate(self, ctx, ctx_length, gen_length, sampler_options, return_logits=False):
-        def generate_sample(context, ctx_length, aux):
-            transformer = CausalTransformerShard(config=self.config,
-                                                 mesh_manager=self.mesh_manager,
-                                                 init_state=self.state,
-                                                 rng_manager=self.rng_manager)
-            _, initial_state = transformer.generate_initial(context, ctx_length)
-
-            def generate_scan_fn(carry, sampler_input):
-                next_token, decode_state, sample_key = carry
-                sample_key, new_key = jax.random.split(sample_key)
-
-                logits, new_state = transformer.generate_once(next_token, decode_state)
-                next_token, sample_info = self.config["sampler"](sample_key, logits, sampler_input, **sampler_options)
-
-                output = (next_token, sample_info, logits) if return_logits else (next_token, sample_info)
-                new_carry = (next_token, new_state, new_key)
-                return new_carry, output
-
-            final_state, outputs = jax.lax.scan(generate_scan_fn, initial_state, xs=aux, length=gen_length)
-            return final_state, outputs
-
-        
-        # Get a new RNG key from RNGManager
+        # Prepare dummy input and RNG
+        context = jnp.transpose(ctx, (1, 0))  # shape: (seq_len, batch)
+        aux = jnp.zeros((ctx.shape[0], gen_length), dtype=jnp.uint32)  # shape: (batch, gen_length)
         key = self.rng_manager.get_current_key()
-        aux = jnp.zeros((ctx.shape[0], gen_length), dtype=jnp.uint32)
+    
+        # Define apply target
+        transformer = CausalTransformerShard(
+            config=self.config,
+            mesh_manager=self.mesh_manager,
+            init_state=self.state,
+            rng_manager=self.rng_manager
+        )
+    
+        # Call via Flax's apply mechanism (compulsory to access `setup()`-defined attrs like rpe, embed, etc.)
+        return transformer.apply(
+            {"params": self.state["params"]},  # Only pass the weights part
+            context,
+            ctx_length,
+            aux,
+            gen_length,
+            sampler_options,
+            return_logits,
+            method=transformer.generate_fn  # Explicitly call your method inside
+        )
 
-        return generate_sample(jnp.transpose(ctx, (1, 0)), ctx_length, aux)
 
     def move(self):
         self.state = self.move_shmap(self.state, None)
