@@ -166,7 +166,10 @@ class CausalTransformer:
         dp = jax.device_count() // self.config["cores_per_replica"]
         mp = self.config["cores_per_replica"]
 
-        mesh_manager = MeshContextManager(dp, mp)
+        #mesh_manager = MeshContextManager(dp, mp)
+        self.mesh_manager = MeshContextManager(dp, mp)  # ✅ assign here, NOT in Flax Module
+        self.mesh = self.mesh_manager.get_mesh()
+        self.state = None  # will be set later
 
         def init_fn(rng, x):
             # Ensure rng is treated as dynamic and not static
