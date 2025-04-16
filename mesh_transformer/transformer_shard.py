@@ -48,7 +48,7 @@ class CausalTransformerShard(nn.Module):
         self.proj = nn.remat(ProjectionShard)(config=self.config, mesh=self.mesh)
         # Use the state provided during initialization
         self.state = self.init_state
-        print(f"State received during initialization with shape: {self.state.shape}")  # Debug: State shape
+        #print(f"State received during initialization with shape: {self.state.shape}")  # Debug: State shape
 
         if self.config["pe"] == "t5":
             self.rpe = RelativePositionEmbs()
