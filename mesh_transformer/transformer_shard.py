@@ -43,6 +43,8 @@ class CausalTransformerShard(nn.Module):
             for _ in range(self.layers)
         ]
 
+        self.mesh_manager = self.mesh_manager  # 🛠️ this line fixes the AttributeError
+        self.rng_manager = self.rng_manager
                 
         #self.embed = nn.Embed(self.config["n_vocab"], self.d_model)
         self.embed = EmbeddingShard(config=self.config, mesh=self.mesh_manager.get_mesh())  # ✅ Correct way
