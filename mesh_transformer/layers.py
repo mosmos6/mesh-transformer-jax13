@@ -387,7 +387,7 @@ class TransformerLayerShard(nn.Module):
         }
 
     def get_init_decode_state(self, x, given_length, attn_bias, mesh_manager):
-        with self.mesh_manager.get_mesh():
+        with mesh_manager.get_mesh():
             print(f"Before f_psum in get_init_decode_state - x shape: {x.shape}")
             x = f_psum(x)
             x = self.norm(x)
