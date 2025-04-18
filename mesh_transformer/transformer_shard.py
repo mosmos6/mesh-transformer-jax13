@@ -124,7 +124,7 @@ class CausalTransformerShard(nn.Module):
 
         states = []
         for i, l in enumerate(self.transformer_layers):
-            res, layer_state = l.get_init_decode_state(x, length - 1, attn_bias)
+            res, layer_state = l.get_init_decode_state(x, length - 1, attn_bias, self.mesh_manager)
             x = x + res
             states.append(layer_state)
 
