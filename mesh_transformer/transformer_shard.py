@@ -175,7 +175,7 @@ class CausalTransformerShard(nn.Module):
 
 
 class CausalTransformer:
-    def __init__(self, config):
+    def __init__(self, config, inference_only=True):
         # Convert non-hashable values in config to hashable types
         self.config = {key: tuple(value) if isinstance(value, (list, np.ndarray, jax.Array)) else value for key, value in config.items()}
         self.rng_manager = RNGManager(seed=0)
@@ -234,9 +234,13 @@ class CausalTransformer:
 
 
         #x = jnp.zeros((self.config["seq"], 1), dtype=jnp.uint32)  # Reduce the batch size to match mp
-        x = jnp.zeros((512, 1), dtype=jnp.uint32)  # Reduce the batch size to match mp
-        self.init_shmap(rng, x)  # Trigger the initialization process
-        print("init shmap done")
+        # Only initialize if not in inference-only mode
+        if not inference_only:
+            x = jnp.zeros((128, 1), dtype=jnp.uint32)  # ✅ reduce memory load
+            self.init_shmap(rng, x)
+            print("init_shmap executed")
+        else:
+            print("Skipped init_shmap (inference_only=True)")
 
         
         def train_fn(state, ctx, tgt):
