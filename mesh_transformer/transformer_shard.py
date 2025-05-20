@@ -175,7 +175,7 @@ class CausalTransformerShard(nn.Module):
 
 
 class CausalTransformer:
-    def __init__(self, config, inference_only=True):
+    def __init__(self, config, inference_only=False):
         # Convert non-hashable values in config to hashable types
         self.config = {key: tuple(value) if isinstance(value, (list, np.ndarray, jax.Array)) else value for key, value in config.items()}
         self.rng_manager = RNGManager(seed=0)
