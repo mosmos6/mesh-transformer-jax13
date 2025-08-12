@@ -2,7 +2,7 @@
   "layers": 28,
   "d_model": 4096, #4096 originally
   "n_heads": 16,
-  "d_head": 8,
+  "d_head": 256, #8 originally
   "n_vocab": 50400,
   "norm": "layernorm",
   "pe": "rotary",
