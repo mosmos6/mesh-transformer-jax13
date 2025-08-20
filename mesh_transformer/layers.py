@@ -282,3 +282,38 @@ class ProjectionShard(nn.Module):
 
     def __call__(self, x):
         return self.forward(x)
+
+class RelativePositionEmbs(nn.Module):
+    num_buckets: int
+    max_distance: int
+
+    @staticmethod
+    def _relative_position_bucket(relative_position, num_buckets=32, max_distance=128):
+        ret = 0
+        n = -relative_position
+        n = np.maximum(n, 0)
+        max_exact = num_buckets // 2
+        is_small = (n < max_exact)
+        val_if_large = max_exact + (
+                np.log(n.astype(np.float32) / max_exact + np.finfo(np.float32).eps) /
+                np.log(max_distance / max_exact) *
+                (num_buckets - max_exact)).astype(np.int32)
+        val_if_large = np.minimum(val_if_large, num_buckets - 1)
+        ret += np.where(is_small, n, val_if_large)
+        return ret
+
+    @nn.compact
+    def __call__(self, qlen, klen, heads):
+        context_position = np.arange(qlen, dtype=jnp.int32)[:, None]
+        memory_position = np.arange(klen, dtype=jnp.int32)[None, :]
+        relative_position = memory_position - context_position
+        rp_bucket = self._relative_position_bucket(relative_position, self.num_buckets, self.max_distance)
+        relative_attention_bias = self.param('rel_embedding', nn.initializers.truncated_normal(stddev=0.02), [heads, self.num_buckets])
+        bcast_iota = jax.lax.broadcasted_iota(jnp.int32, (self.num_buckets, 1, 1), 0)
+        rp_bucket_one_hot = jnp.array(rp_bucket[jnp.newaxis, Ellipsis] == bcast_iota).astype(relative_attention_bias.dtype)
+        values = jax.lax.dot_general(
+            relative_attention_bias,
+            rp_bucket_one_hot,
+            (((1,), (0,)), ((), ())))
+        return values
+
