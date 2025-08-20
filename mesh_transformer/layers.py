@@ -22,8 +22,17 @@ class ReplicatedLayerNorm(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        # Single-core: plain LayerNorm is fine (replicated LN reduces to identity)
-        return nn.LayerNorm(epsilon=1e-5, use_scale=True, use_bias=self.offset)(x)
+        features = x.shape[-1]
+        scale  = self.param("scale",  nn.initializers.ones,  (features,), x.dtype)
+        if self.offset:
+            offset = self.param("offset", nn.initializers.zeros, (features,), x.dtype)
+        mean = jnp.mean(x, axis=-1, keepdims=True)
+        var  = jnp.var(x, axis=-1, keepdims=True)
+        inv  = scale * jax.lax.rsqrt(var + self.eps)
+        y = inv * (x - mean)
+        if self.offset:
+            y = y + offset
+        return y
 
 
 def getnorm(kind: str, *, mesh=None, name="norm"):
