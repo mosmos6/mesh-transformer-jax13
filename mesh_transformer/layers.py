@@ -15,44 +15,46 @@ from jax.sharding import PartitionSpec as P
 # -------------------- Norms --------------------
 
 class ReplicatedLayerNorm(nn.Module):
-    """LayerNorm with scale/offset replicated over model-parallel shards."""
+    """
+    Flax LayerNorm that *accepts* a `mesh` kwarg for API parity with the rest of
+    the codebase, but works in both single-core and multi-core without relying
+    on old xmap-style axis names. For inference, LN params are replicated per
+    shard, so we do not need cross-shard gathers here.
+    """
+    mesh: object = None          # kept for interface compatibility
     offset: bool = True
-    name: str = "layer_norm"
     eps: float = 1e-5
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         features = x.shape[-1]
-        scale  = self.param("scale",  nn.initializers.ones,  (features,), x.dtype)
+
+        # Parameter shapes must match your leaf spec: (4096,) for GPT‑J
+        scale = self.param("scale", nn.initializers.ones, (features,))
         if self.offset:
-            offset = self.param("offset", nn.initializers.zeros, (features,), x.dtype)
+            offset = self.param("offset", nn.initializers.zeros, (features,))
+
         mean = jnp.mean(x, axis=-1, keepdims=True)
         var  = jnp.var(x, axis=-1, keepdims=True)
-        inv  = scale * jax.lax.rsqrt(var + self.eps)
+
+        inv = scale * jax.lax.rsqrt(var + self.eps)
         y = inv * (x - mean)
         if self.offset:
             y = y + offset
         return y
 
 
-def getnorm(kind: str, *, mesh=None, name="norm"):
+def getnorm(kind: str, *, mesh=None, name: str = "norm"):
+    """
+    Keep the old API: call like getnorm(config["norm"], mesh=self.mesh, name="norm").
+    Only the 'layernorm' path is used in your config; others raise to avoid silent mismatches.
+    """
     if kind == "layernorm":
-        return ReplicatedLayerNorm(mesh=mesh, name=name)
-    elif kind == "layernorm-desync":
-        return nn.LayerNorm(name=name)
+        return ReplicatedLayerNorm(mesh=mesh, offset=True, name=name)
     elif kind == "layernorm-nobias":
         return ReplicatedLayerNorm(mesh=mesh, offset=False, name=name)
-    elif kind == "rmsnorm":
-        # Simple RMS: scale only
-        class _RMS(nn.Module):
-            name: str = "rms_norm"
-            @nn.compact
-            def __call__(self, x):
-                g = self.param("scale", nn.initializers.constant(x.shape[-1] ** 0.5), (x.shape[-1],))
-                return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-5) * g
-        return _RMS(name=name)
     else:
-        raise NotImplementedError(f"norm kind '{kind}'")
+        raise NotImplementedError(f"norm='{kind}' is not implemented in this Flax port")
 
 # -------------------- Rotary helpers --------------------
 
