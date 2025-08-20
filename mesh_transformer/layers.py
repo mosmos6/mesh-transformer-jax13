@@ -19,6 +19,7 @@ class ReplicatedLayerNorm(nn.Module):
     mesh: object
     offset: bool = True
     name: str = "layer_norm"
+    eps: float = 1e-5
 
     @nn.compact
     def __call__(self, x):
