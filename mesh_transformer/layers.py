@@ -16,7 +16,6 @@ from jax.sharding import PartitionSpec as P
 
 class ReplicatedLayerNorm(nn.Module):
     """LayerNorm with scale/offset replicated over model-parallel shards."""
-    mesh: object
     offset: bool = True
     name: str = "layer_norm"
     eps: float = 1e-5
