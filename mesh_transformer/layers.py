@@ -21,25 +21,10 @@ class ReplicatedLayerNorm(nn.Module):
     name: str = "layer_norm"
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        mean = jnp.mean(x, axis=-1, keepdims=True)
-        var  = jnp.var(x,  axis=-1, keepdims=True)
-        hidden = x.shape[-1]
+    def __call__(self, x):
+        # Single-core: plain LayerNorm is fine (replicated LN reduces to identity)
+        return nn.LayerNorm(epsilon=1e-5, use_scale=True, use_bias=self.offset)(x)
 
-        scale  = self.param("scale", nn.initializers.ones,  (hidden,))
-        offset = self.param("offset", nn.initializers.zeros, (hidden,))
-        # Gather across 'mp' if present and >1 devices
-        axis = "mp" if hasattr(self, "mesh") and "mp" in getattr(self.mesh, "axis_names", ()) else None
-        if axis and self.mesh.shape.get(axis, 1) > 1:
-            scale  = jax.lax.all_gather(scale,  axis)[0]
-            offset = jax.lax.all_gather(offset, axis)[0]
-        # Broadcast to x
-        scale  = jnp.broadcast_to(scale,  x.shape)
-        offset = jnp.broadcast_to(offset, x.shape)
-        mean   = jnp.broadcast_to(mean,   x.shape)
-
-        inv = scale * jax.lax.rsqrt(var + 1e-5)
-        return (inv * (x - mean) + (offset if self.offset else 0.0))
 
 def getnorm(kind: str, *, mesh=None, name="norm"):
     if kind == "layernorm":
@@ -280,8 +265,16 @@ class ProjectionShard(nn.Module):
         x = self.layer_norm(x)
         return self.dense(x)
 
+    @nn.compact
     def __call__(self, x):
-        return self.forward(x)
+        # Match training: LayerNorm -> Linear(n_vocab) with bias
+        x = ReplicatedLayerNorm(offset=True)(x)
+        n_vocab = int(self.config["n_vocab"])           # 50400 in your JSON
+        d_model = int(self.config["d_model"])           # 4096
+        # init similar scale as Haiku default (ok to keep it simple)
+        kernel_init = nn.initializers.normal(stddev=1.0/np.sqrt(d_model))
+        logits = nn.Dense(features=n_vocab, use_bias=True, kernel_init=kernel_init)(x)
+        return logits
 
 class RelativePositionEmbs(nn.Module):
     num_buckets: int
