@@ -57,9 +57,9 @@ class CausalTransformerShard(nn.Module):
 
     def __call__(self, x, mask=0.0):
         
-        print(f"Shape of x before embedding: {x.shape}")  # Debug: Check x shape before embedding
+        #print(f"Shape of x before embedding: {x.shape}")  # Debug: Check x shape before embedding
         x = self.embed(x)
-        print(f"Shape of x after embedding: {x.shape}")  # Debug: Check x shape after embedding
+        #print(f"Shape of x after embedding: {x.shape}")  # Debug: Check x shape after embedding
 
         # Calculate attn_bias
         input_len = x.shape[0]
