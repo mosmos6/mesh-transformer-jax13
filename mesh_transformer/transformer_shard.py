@@ -71,9 +71,9 @@ class CausalTransformerShard(nn.Module):
 
         # Initialize layer index and pass it to each layer
         for layer_index, layer in enumerate(self.transformer_layers):
-            print(f"Shape of x before layer {layer_index}: {x.shape}")  # Debug: Check x shape before each layer
+            #print(f"Shape of x before layer {layer_index}: {x.shape}")  # Debug: Check x shape before each layer
             x = layer(x, attn_bias, layer_index, self.state)  # Pass the layer_index here
-            print(f"Shape of x after layer {layer_index}: {x.shape}")  # Debug: Check x shape after each layer
+            #print(f"Shape of x after layer {layer_index}: {x.shape}")  # Debug: Check x shape after each layer
             
         print(f"Shape of x before proj call: {x.shape}") 
         return self.proj(x)
