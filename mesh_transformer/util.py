@@ -125,7 +125,7 @@ def g_psum(x):
     mesh = MeshContextManager().get_mesh()
     axis_name = "mp" if "mp" in mesh.axis_names else "single_core"
     if mesh.shape.get(axis_name, 1) == 1:
-        print("Skipping psum in g_psum: only 1 device")
+        #print("Skipping psum in g_psum: only 1 device")
         return x
     return jax.lax.psum(x, axis_name)
 
