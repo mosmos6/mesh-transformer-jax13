@@ -66,11 +66,9 @@ def _fixed_pos_embedding(seq_len: int, dim: int):
     return jnp.sin(freqs), jnp.cos(freqs)
 
 def _rotate_every_two(x):
-    """(..., D) where D even -> rotation pairs (x0,x1)->(-x1,x0)."""
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
-    x_rot = jnp.stack((-x2, x1), axis=-1)
-    return rearrange(x_rot, "... d j -> ... (d j)")
+    return jnp.stack((-x2, x1), axis=-1).reshape(x.shape)
 
 def _apply_rotary(x, sin, cos):
     # x: (B, T, H, d_rotary), sin/cos: (T, 1, 1, d_rotary)
@@ -92,6 +90,56 @@ def _apply_rotary_qk(q, k, T, H, d_head, d_rotary):
     q = jnp.concatenate([q_rot, q_pass], axis=-1)
     k = jnp.concatenate([k_rot, k_pass], axis=-1)
     return q, k
+
+def _apply_rotary_qk_safe(q, k, T, d_rot):
+    # q,k: (B,T,H,dh) ,  d_rot<=dh を保証
+    dh = q.shape[-1]
+    d_rot = int(min(int(d_rot), int(dh)))
+    if d_rot <= 0: return q, k
+    pos = jnp.arange(T, dtype=jnp.float32)
+    inv = 1.0 / (10000.0 ** (jnp.arange(0, d_rot, 2, dtype=jnp.float32) / d_rot))
+    freqs = jnp.einsum('t,f->tf', pos, inv)           # (T, d_rot/2)
+    cos = jnp.repeat(jnp.cos(freqs), 2, axis=-1)      # (T, d_rot)
+    sin = jnp.repeat(jnp.sin(freqs), 2, axis=-1)      # (T, d_rot)
+    # 4D にブロードキャスト (B,T,H,d_rot)
+    def _rot(x):
+        x_rot, x_pass = x[...,:d_rot], x[...,d_rot:]
+        cc = cos[jnp.newaxis, :, jnp.newaxis, :]
+        ss = sin[jnp.newaxis, :, jnp.newaxis, :]
+        x_rot = x_rot * cc + _rotate_every_two(x_rot) * ss
+        return jnp.concatenate([x_rot, x_pass], axis=-1)
+    return _rot(q), _rot(k)
+
+def _attn_stable(self, x_norm, attn_bias):
+    B, T, _ = x_norm.shape
+    H, dh = self.H, self.dh
+
+    # QKV: f32 コア
+    q = self.q(x_norm).astype(jnp.float32).reshape(B, T, H, dh)
+    k = self.k(x_norm).astype(jnp.float32).reshape(B, T, H, dh)
+    v = self.v(x_norm).astype(jnp.float32).reshape(B, T, H, dh)
+
+    # RoPE（安全版）
+    if getattr(self, "is_rotary", True) and getattr(self, "pe_rotary_dims", 0) > 0:
+        q, k = _apply_rotary_qk_safe(q, k, T, int(self.pe_rotary_dims))
+
+    # QK^T / sqrt(d)
+    scores = jnp.einsum("bthd,bThd->bhtT", q, k) / jnp.sqrt(jnp.asarray(dh, dtype=jnp.float32))
+
+    # 有限マスク + 任意 bias
+    mask_bool = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
+    scores = jnp.where(mask_bool, scores, jnp.array(-1e9, dtype=jnp.float32))
+    if attn_bias is not None and jnp.ndim(attn_bias) > 0:
+        scores = scores + attn_bias.astype(scores.dtype)
+
+    # 安定化
+    scores = scores - jnp.max(scores, axis=-1, keepdims=True)
+    attn_w = jax.nn.softmax(scores, axis=-1)
+
+    # 文脈和 → bf16 に戻して O 射影
+    ctx = jnp.einsum("bhtT,bThd->bthd", attn_w, v).reshape(B, T, self.D)
+    ctx = ctx.astype(x_norm.dtype)
+    return self.o(ctx)
 
 # -------------------- Embedding --------------------
 
