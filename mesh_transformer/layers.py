@@ -194,41 +194,36 @@ class TransformerLayerShard(nn.Module):
         self.is_rotary = (self.config.get("pe", "rotary") == "rotary")
 
     def _attn(self, x_norm, attn_bias):
-        """x_norm: (B, T, D)  -> attn_out: (B, T, D)"""
         B, T, _ = x_norm.shape
-
-        # Projections
-        q = self.q(x_norm)  # (B,T,D)
-        k = self.k(x_norm)
-        v = self.v(x_norm)
-
-        # Split heads
-        q = q.reshape(B, T, self.H, self.dh)
-        k = k.reshape(B, T, self.H, self.dh)
-        v = v.reshape(B, T, self.H, self.dh)
-
-        # Rotary (first pe_rotary_dims)
-        if self.is_rotary and self.pe_rotary_dims > 0:
-            q, k = _apply_rotary_qk(q, k, T=T, H=self.H, d_head=self.dh, d_rotary=self.pe_rotary_dims)
-
-        # Scaled dot-product attention with causal mask
-        attn_scores = jnp.einsum("bthd, bThd -> bhtT", q, k)  # (B,H,T,T)
-        attn_scores = attn_scores / jnp.sqrt(jnp.asarray(self.dh, dtype=attn_scores.dtype))
-
-        # causal mask (T,T), broadcast over B,H
-        causal = np.tril(np.ones((T, T), dtype=np.float32))
-        attn_scores = attn_scores + (jnp.log(causal + 1e-9) - jnp.log1p(-causal))  # 0 or -inf
-
+        H, dh = self.H, self.dh
+    
+        q = self.q(x_norm).astype(jnp.float32).reshape(B, T, H, dh)
+        k = self.k(x_norm).astype(jnp.float32).reshape(B, T, H, dh)
+        v = self.v(x_norm).astype(jnp.float32).reshape(B, T, H, dh)
+    
+        # ★ RoPE 安全版：d_rotary <= dh を強制し (B,T,H,dh) のまま回転
+        d_rot = int(min(int(self.pe_rotary_dims), int(dh))) if getattr(self, "is_rotary", True) else 0
+        if d_rot > 0:
+            q, k = _apply_rotary_qk_safe(q, k, T, d_rot)  # ← 以前あなたが使った安全版
+    
+        # Scaled dot-product
+        scores = jnp.einsum("bthd,bThd->bhtT", q, k) / jnp.sqrt(jnp.asarray(dh, dtype=jnp.float32))
+    
+        # ★ 有限因果マスク（-1e9）; 形は (T,T) を (B,H,T,T) にブロードキャスト
+        causal = (jnp.tril(jnp.ones((T, T), dtype=jnp.bool_)))
+        scores = jnp.where(causal, scores, jnp.asarray(-1e9, dtype=scores.dtype))
+    
         if attn_bias is not None and jnp.ndim(attn_bias) > 0:
-            # Expecting bias broadcastable to (B,H,T,T) or (H,T,T)
-            attn_scores = attn_scores + attn_bias
-
-        attn_weights = jax.nn.softmax(attn_scores, axis=-1)
-        ctx = jnp.einsum("bhtT, bThd -> bthd", attn_weights, v)  # (B,T,H,dh)
-        ctx = ctx.reshape(B, T, self.D)  # merge heads
-
-        # Learned O projection
+            scores = scores + attn_bias.astype(scores.dtype)  # 形状が (H,T,T) でも (T,T) でも可
+    
+        # ★ 安定化
+        scores = scores - jnp.max(scores, axis=-1, keepdims=True)
+        w = jax.nn.softmax(scores, axis=-1)
+    
+        ctx = jnp.einsum("bhtT,bThd->bthd", w, v).reshape(B, T, self.D)
+        ctx = ctx.astype(x_norm.dtype)
         return self.o(ctx)
+
 
     def _ff(self, x_norm):
         y = self.dense_proj(x_norm)
@@ -316,24 +311,17 @@ class ProjectionShard(nn.Module):
 
     def setup(self):
         self.dim = int(self.config["d_model"])
+        # ★ setup で作ったものを __call__ で必ず使う
         self.layer_norm = getnorm(self.config["norm"], mesh=self.mesh, name="layer_norm")
-        self.dense = nn.Dense(self.dim, name="dense")  # (4096,4096) + bias
-
-    @nn.remat
-    def forward(self, x):
-        x = self.layer_norm(x)
-        return self.dense(x)
+        self.dense_vocab = nn.Dense(int(self.config["n_vocab"]), use_bias=True, name="Dense_0")
 
     @nn.compact
     def __call__(self, x):
-        # Match training: LayerNorm -> Linear(n_vocab) with bias
-        x = ReplicatedLayerNorm(offset=True)(x)
-        n_vocab = int(self.config["n_vocab"])           # 50400 in your JSON
-        d_model = int(self.config["d_model"])           # 4096
-        # init similar scale as Haiku default (ok to keep it simple)
-        kernel_init = nn.initializers.normal(stddev=1.0/np.sqrt(d_model))
-        logits = nn.Dense(features=n_vocab, use_bias=True, kernel_init=kernel_init)(x)
+        # ★ ここで新しい LN/Dense を作らない（ReplicatedLayerNorm() を直接呼ばない）
+        x = self.layer_norm(x)       # → /proj/{layer_norm}/(scale,offset) を使用
+        logits = self.dense_vocab(x) # → /proj/Dense_0/(kernel,bias) を使用（形 (D,V), (V,))
         return logits
+
 
 class RelativePositionEmbs(nn.Module):
     num_buckets: int
