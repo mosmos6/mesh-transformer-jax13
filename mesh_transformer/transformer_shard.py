@@ -57,26 +57,20 @@ class CausalTransformerShard(nn.Module):
 
     def __call__(self, x, mask=0.0):
         
-        #print(f"Shape of x before embedding: {x.shape}")  # Debug: Check x shape before embedding
-        x = self.embed(x)
-        #print(f"Shape of x after embedding: {x.shape}")  # Debug: Check x shape after embedding
-
-        # Calculate attn_bias
-        input_len = x.shape[0]
-
+        # x: (B,T) のはず
+        x = self.embed(x)                 # -> (B,T,D)
+    
+        B, T, _ = x.shape                 # ★ ここで T を shape[1] から取る
         if self.rpe is not None:
-            attn_bias = self.rpe(input_len, input_len, self.heads_per_shard)
+            attn_bias = self.rpe(T, T, self.heads_per_shard)
         else:
-            attn_bias = mask  # If rpe is not used, simply set attn_bias to the mask or 0
-
-        # Initialize layer index and pass it to each layer
+            attn_bias = mask
+    
         for layer_index, layer in enumerate(self.transformer_layers):
-            #print(f"Shape of x before layer {layer_index}: {x.shape}")  # Debug: Check x shape before each layer
-            x = layer(x, attn_bias, layer_index, self.state)  # Pass the layer_index here
-            #print(f"Shape of x after layer {layer_index}: {x.shape}")  # Debug: Check x shape after each layer
-            
-        #print(f"Shape of x before proj call: {x.shape}") 
-        return self.proj(x)
+            x = layer(x, attn_bias, layer_index, self.state)
+    
+        return self.proj(x)               # (B,T,V)
+
 
     def eval(self, context, target, z_loss=0., mask=0.0):
         input_len = context.shape[0]
