@@ -312,7 +312,7 @@ class ProjectionShard(nn.Module):
     def setup(self):
         self.dim = int(self.config["d_model"])
         # ★ setup で作ったものを __call__ で必ず使う
-        self.layer_norm = getnorm(self.config["norm"], mesh=self.mesh, name="layer_norm")
+        self.layer_norm = getnorm(self.config["norm"], mesh=self.mesh, name="layer_norm_0")
         self.dense_vocab = nn.Dense(int(self.config["n_vocab"]), use_bias=True, name="Dense_0")
 
     @nn.compact
