@@ -269,8 +269,8 @@ class TransformerLayerShard(nn.Module):
         v = self.v(x_norm).reshape(B, T, self.H, self.dh)
         #return jnp.zeros_like(xBTD), {"k": k, "v": v, "tokens_decoded": given_length.astype(jnp.uint32)}
         # given_length は Python int で来ることがあるため、JAX スカラーへ正規化
-+       tokens_decoded = jnp.asarray(given_length, dtype=jnp.uint32)
-+       return jnp.zeros_like(xBTD), {"k": k, "v": v, "tokens_decoded": tokens_decoded}
+        tokens_decoded = jnp.asarray(given_length, dtype=jnp.uint32)
+        return jnp.zeros_like(xBTD), {"k": k, "v": v, "tokens_decoded": tokens_decoded}
 
     def decode_once(self, decode_state, x, attn_bias):
         """x: (B=1,1,D). We’ll compute 1-step attention against cached KV."""
