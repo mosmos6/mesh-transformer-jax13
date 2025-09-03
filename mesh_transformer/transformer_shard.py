@@ -128,10 +128,13 @@ class CausalTransformerShard(nn.Module):
         return self.proj(x), (last.astype(jnp.uint32), states, rng_key)
 
     def generate_once(self, new_tok, state, mask=0.0):
-        input_len = state[0]["v"].shape[0]
+        #input_len = state[0]["v"].shape[0]
+        # k/v キャッシュのレイアウトは (B, T, H, Dh) 前提なので、時系列長は axis=1
+        t_cache = state[0]["v"].shape[1]
 
         if self.rpe is not None:
-            attn_bias = self.rpe(input_len, input_len, self.heads_per_shard)
+            # 直近トークンを 1 ステップ追加して計算するため、長さは t_cache+1 で RPE を作る
+            attn_bias = self.rpe(t_cache + 1, t_cache + 1, self.heads_per_shard)
             attn_bias = attn_bias[:, -1:, :]
         else:
             attn_bias = mask
