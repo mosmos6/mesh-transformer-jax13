@@ -249,6 +249,11 @@ class TransformerLayerShard(nn.Module):
 
     # --- Decoding helpers (kept compatible with your current call sites; refine in step #4) ---
 
+    def _ensure_btd(x):
+        if x.ndim == 1: return x[None,None,:]
+        if x.ndim == 2: return x[None,:,:]
+        return x
+    
     def get_init_decode_state(self, x, given_length, attn_bias, mesh_manager=None):
         """x: (T,B,D) or (B,T,D) in your current generator; we won’t rely on this path yet."""
         # Minimal stub: produce a KV cache consistent with decode_once
@@ -262,7 +267,10 @@ class TransformerLayerShard(nn.Module):
         x_norm = self.norm(xBTD)
         k = self.k(x_norm).reshape(B, T, self.H, self.dh)
         v = self.v(x_norm).reshape(B, T, self.H, self.dh)
-        return jnp.zeros_like(xBTD), {"k": k, "v": v, "tokens_decoded": given_length.astype(jnp.uint32)}
+        #return jnp.zeros_like(xBTD), {"k": k, "v": v, "tokens_decoded": given_length.astype(jnp.uint32)}
+        # given_length は Python int で来ることがあるため、JAX スカラーへ正規化
++       tokens_decoded = jnp.asarray(given_length, dtype=jnp.uint32)
++       return jnp.zeros_like(xBTD), {"k": k, "v": v, "tokens_decoded": tokens_decoded}
 
     def decode_once(self, decode_state, x, attn_bias):
         """x: (B=1,1,D). We’ll compute 1-step attention against cached KV."""
