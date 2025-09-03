@@ -1,243 +1,213 @@
+# mesh_transformer/transformer_shard.py
 import os
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Allows dynamic allocations
-# os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1 --xla_gpu_force_compilation_parallelism=1'
-# print("xla flags done") 
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
 from functools import partial
+from typing import Any, Dict, Tuple
+
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+from flax.linen import remat
+
+# メッシュ / shard_map
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, PartitionSpec as P
 from jax.experimental.shard_map import shard_map
-import flax.linen as nn
-from flax.linen import remat
-import jax
-import jax.numpy as jnp
-import optax
-import numpy as np
 
-# Assume these imports are defined properly
+# プロジェクト内
 from mesh_transformer.util import to_f32, to_bf16, global_norm
-from mesh_transformer.layers import EmbeddingShard, TransformerLayerShard, RelativePositionEmbs, ProjectionShard
-from mesh_transformer.checkpoint import write_ckpt, read_ckpt
-from mesh_transformer.mesh_context_manager import MeshContextManager  # Import from new file
+from mesh_transformer.layers import (
+    EmbeddingShard, TransformerLayerShard, RelativePositionEmbs, ProjectionShard
+)
+from mesh_transformer.mesh_context_manager import MeshContextManager
 from mesh_transformer.rng_manager import RNGManager
 
+Array = jnp.ndarray
 
 
+def _ensure_BT(x: Array) -> Array:
+    """(T,) -> (1,T) / (T,D)->(1,T,D) に正規化。その他はそのまま。"""
+    if x.ndim == 1:  # (T,)
+        return x[None, :]
+    return x
+
+
+def _ensure_BTD(x: Array) -> Array:
+    """(T,D)->(1,T,D) に正規化。その他はそのまま。"""
+    if x.ndim == 2:
+        return x[None, :, :]
+    return x
 
 
 class CausalTransformerShard(nn.Module):
-    config: dict
-    mesh_manager: object
-    init_state: jnp.ndarray
-    rng_manager: object  # Add RNGManager as a dependency
+    """Flax Module 本体（1レプリカ=1シャードの計算定義）"""
+    config: Dict[str, Any]
+    mesh_manager: MeshContextManager
+    rng_manager: RNGManager
 
     def setup(self):
-        self.mesh = self.mesh_manager.get_mesh()  # Store mesh instance
-        self.layers = self.config["layers"]
-        self.d_model = self.config["d_model"]
-        self.n_heads = self.config["n_heads"]
-        self.heads_per_shard = self.n_heads // self.config["cores_per_replica"]
+        cfg = self.config
+        self.layers = int(cfg["layers"])
+        self.d_model = int(cfg["d_model"])
+        self.n_heads = int(cfg["n_heads"])
+        self.d_head  = int(cfg["d_head"])
+        self.heads_per_shard = self.n_heads // int(cfg["cores_per_replica"])
+        self.pe_type = cfg.get("pe", "rotary")
+        self.pe_rotary_dims = int(cfg.get("pe_rotary_dims", 64))
+
+        mesh = self.mesh_manager.get_mesh()
+        # Embed / Blocks / LM head
+        self.embed = EmbeddingShard(config=cfg, mesh=mesh)
         self.transformer_layers = [
-            remat(TransformerLayerShard)(config=self.config, mesh=self.mesh) 
+            remat(TransformerLayerShard)(config=cfg, mesh=mesh)
             for _ in range(self.layers)
         ]
-                
-        #self.embed = nn.Embed(self.config["n_vocab"], self.d_model)
-        self.embed = EmbeddingShard(config=self.config, mesh=self.mesh_manager.get_mesh())  # ✅ Correct way
-        self.proj = nn.remat(ProjectionShard)(config=self.config, mesh=self.mesh)
-        # Use the state provided during initialization
-        self.state = self.init_state
-        #print(f"State received during initialization with shape: {self.state.shape}")  # Debug: State shape
+        self.proj = remat(ProjectionShard)(config=cfg, mesh=mesh)
 
-        if self.config["pe"] == "t5":
-            self.rpe = RelativePositionEmbs()
-        else:
-            self.rpe = None
+        self.rpe = RelativePositionEmbs() if self.pe_type == "t5" else None
 
-    def __call__(self, x, mask=0.0):
-        
-        # x: (B,T) のはず
-        x = self.embed(x)                 # -> (B,T,D)
-    
-        B, T, _ = x.shape                 # ★ ここで T を shape[1] から取る
+    # --------- forward (B,T) -> (B,T,V) ----------
+    def __call__(self, xBT: Array, mask: float = 0.0) -> Array:
+        # ids (B,T) -> (B,T,D)
+        x = self.embed(xBT)
+        x = _ensure_BTD(x)  # (B,T,D)
+        B, T, _ = x.shape
+
         if self.rpe is not None:
             attn_bias = self.rpe(T, T, self.heads_per_shard)
         else:
             attn_bias = mask
-    
-        for layer_index, layer in enumerate(self.transformer_layers):
-            x = layer(x, attn_bias, layer_index, self.state)
-    
-        return self.proj(x)               # (B,T,V)
 
+        # ここは「層が delta を返す」契約で統一
+        for li, layer in enumerate(self.transformer_layers):
+            delta = layer(x, attn_bias, li)  # (B,T,D)
+            x = x + delta
 
-    def eval(self, context, target, z_loss=0., mask=0.0):
-        input_len = context.shape[0]
+        return self.proj(x)  # (B,T,V)
 
-        if self.rpe is not None:
-            attn_bias = self.rpe(input_len, input_len, self.heads_per_shard)
-        else:
-            attn_bias = mask
+    # --------- KV 初期化（prefix 一括） ----------
+    def generate_initial(self, context_1d: Array, gen_len: int, mask: float = 0.0):
+        """context_1d: (T,) uint32。戻り: (logits(B, T-1, V)), (last(1,), states, rng)"""
+        assert isinstance(gen_len, int), "gen_len must be Python int (static)"
+        ctx = jnp.asarray(context_1d, jnp.uint32)
+        assert ctx.ndim == 1, "pass (T,) ids here"
 
-        x = self.embed(context)
-
-        # Pass the layer index in eval as well
-        for layer_index, layer in enumerate(self.transformer_layers):
-            x = x + layer(x, attn_bias, layer_index)  # Pass layer_index here
-
-        shard_start_index = compute_shard_start_index(self.proj.dim_per_shard)
-
-        # Ensure RNGManager is used for key consistency
-        rng_key = self.rng_manager.get_current_key()
-
-        return self.proj.loss(x, target, shard_start_index, z_loss)
-
-    def loss(self, ctx, tgt, z_loss=False, mask=0.0):
-        loss, correct = self.eval(ctx, tgt, float(z_loss), mask=mask)
-
-        return {
-            "loss": loss.mean(),
-            "last_loss": loss[-1].mean(),
-            "all_loss": loss,
-            "correct": correct
-        }
-
-    def generate_initial(self, context, length, mask=0.0):
-        last = context[-1:]
-        context = context[:-1]
-
-        input_len = context.shape[0]
+        last = ctx[-1: ]           # (1,)
+        prefix = ctx[:-1]          # (T-1,)
+        x = self.embed(prefix)     # (T-1,D) もしくは (B=1,T-1,D)
+        x = _ensure_BTD(x)         # -> (1,T-1,D)
+        B, Tm1, _ = x.shape
 
         if self.rpe is not None:
-            attn_bias = self.rpe(input_len, input_len, self.heads_per_shard)
+            attn_bias = self.rpe(Tm1, Tm1, self.heads_per_shard)
         else:
             attn_bias = mask
-
-        x = self.embed(context)
 
         states = []
-        for i, l in enumerate(self.transformer_layers):
-            res, layer_state = l.get_init_decode_state(x, length - 1, attn_bias, self.mesh_manager)
-            x = x + res
-            states.append(layer_state)
+        for li, layer in enumerate(self.transformer_layers):
+            # 契約: (residual_delta, layer_state)
+            delta, st = layer.get_init_decode_state(x, gen_len - 1, attn_bias, self.mesh_manager)
+            x = x + delta
+            states.append(st)
 
-        # Use RNGManager to get the current RNG key
-        rng_key = self.rng_manager.get_current_key()
+        logits = self.proj(x)  # (1,T-1,V)
+        rng = self.rng_manager.get_current_key()
+        return logits, (last, tuple(states), rng)
 
-        return self.proj(x), (last.astype(jnp.uint32), states, rng_key)
+    # --------- 単ステップ decode ----------
+    def generate_once(self, new_tok_1d: Array, state_tuple, mask: float = 0.0):
+        """new_tok_1d:(1,) uint32 / state_tuple=(last(1,), states, rng)"""
+        last, states, rng = state_tuple  # 互換のため last/rng も保持
 
-    def generate_once(self, new_tok, state, mask=0.0):
-        #input_len = state[0]["v"].shape[0]
-        # k/v キャッシュのレイアウトは (B, T, H, Dh) 前提なので、時系列長は axis=1
-        t_cache = state[0]["v"].shape[1]
+        x = self.embed(new_tok_1d)  # (1,D)
+        if x.ndim == 2:
+            x = x[:, None, :]       # -> (1,1,D)
+        else:
+            x = _ensure_BTD(x)
+
+        # キャッシュ長は (B,T,H,Dh) の T 軸
+        kv_len = int(states[0]["v"].shape[1]) if (len(states) > 0 and "v" in states[0]) else 0
 
         if self.rpe is not None:
-            # 直近トークンを 1 ステップ追加して計算するため、長さは t_cache+1 で RPE を作る
-            attn_bias = self.rpe(t_cache + 1, t_cache + 1, self.heads_per_shard)
-            attn_bias = attn_bias[:, -1:, :]
+            # ここで 1 ステップ分のバイアスに整形
+            attn_bias_full = self.rpe(kv_len + 1, kv_len + 1, self.heads_per_shard)
+            attn_bias = attn_bias_full[:, -1:, :]  # 末尾 1 ステップ
         else:
             attn_bias = mask
 
-        x = self.embed(new_tok)
-
         new_states = []
+        for li, (layer, st) in enumerate(zip(self.transformer_layers, states)):
+            # 契約: (residual_delta, new_state)
+            delta, st2 = layer.decode_once(st, x, attn_bias)
+            x = x + delta
+            new_states.append(st2)
 
-        for i, (l, s) in enumerate(zip(self.transformer_layers, state)):
-            res, layer_state = l.decode_once(s, x, attn_bias)
-            x = x + res
-            new_states.append(layer_state)
-
-        return self.proj(x), new_states
-
-
-    def generate_fn(self, context, ctx_length, aux, gen_length, sampler_options, return_logits=False):
-        _, initial_state = self.generate_initial(context, ctx_length)
-
-        def generate_scan_fn(carry, sampler_input):
-            next_token, decode_state, sample_key = carry
-            sample_key, new_key = jax.random.split(sample_key)
-    
-            logits, new_state = self.generate_once(next_token, decode_state)
-            next_token, sample_info = self.config["sampler"](sample_key, logits, sampler_input, **sampler_options)
-    
-            output = (next_token, sample_info, logits) if return_logits else (next_token, sample_info)
-            new_carry = (next_token, new_state, new_key)
-            return new_carry, output
-
-        final_state, outputs = jax.lax.scan(generate_scan_fn, initial_state, xs=aux, length=gen_length)
-        return final_state, outputs
+        logits = self.proj(x)  # (1,1,V)
+        return logits, (last, tuple(new_states), rng)
 
 
-
-
+# =========================
+#  外側ラッパ: shard_map を保持
+# =========================
 class CausalTransformer:
-    def __init__(self, config, inference_only=False):
-        # Convert non-hashable values in config to hashable types
-        self.config = {key: tuple(value) if isinstance(value, (list, np.ndarray, jax.Array)) else value for key, value in config.items()}
+    """
+    * dp×mp メッシュを張り、shard_map 付きの関数を公開する外側ラッパ。
+    * device_count()==1 の時は JIT にフォールバック（コードとしては shard_map を保持）。
+    """
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config.copy()
         self.rng_manager = RNGManager(seed=0)
-                     
-        optimizer = self.config["optimizer"]
-        dp = jax.device_count() // self.config["cores_per_replica"]
-        mp = self.config["cores_per_replica"]
 
-        mesh_manager = MeshContextManager(dp, mp)
-        self.mesh_manager = MeshContextManager(dp, mp)  # ✅ assign here, NOT in Flax Module
-        self.mesh = self.mesh_manager.get_mesh()
-        self.state = None  # will be set later
+        # メッシュ準備
+        cores_per_replica = int(self.config.get("cores_per_replica", 1))
+        devs = jax.devices()
+        dp = max(1, len(devs) // cores_per_replica)
+        mp = cores_per_replica
+        self.mesh_manager = MeshContextManager(dp, mp)
+        self.mesh: Mesh = self.mesh_manager.get_mesh()
 
-        def init_fn(rng, x):
-            # Ensure rng is treated as dynamic and not static
-            print(f"Shape of sample_input before shmap: {x.shape}")  # Debug: Before shmap
-            print(f"RNG shape in init_fn: {rng.shape}")  # Should be (2,)
-            state = jax.random.normal(rng, (self.config["layers"], self.config["d_model"], self.config["n_heads"]))
-            self.state = state  # Set state manually
-            print(f"State initialized with shape: {self.state.shape}")  # Debug: State shape
-            print(f"Shape of x after init_shmap: {self.state.shape}")  # Debug: After shmap
-            
-            model = CausalTransformerShard(config=self.config, mesh_manager=mesh_manager, init_state=self.state, rng_manager=self.rng_manager)
-            print(f"RNG used in CausalTransformerShard: {rng.shape}")  # Debug
-            print("causaltransformershard loaded")
-            model_output = model.init(rng, x)
-            return model_output, self.state
+        # 本体 Module
+        self.shard_mod = CausalTransformerShard(self.config, self.mesh_manager, self.rng_manager)
+
+        # ===== shmap: generate_initial =====
+        def _gen_init_fn(params, ctx_1d, gen_len: int):
+            return self.shard_mod.apply(params, ctx_1d, int(gen_len), method=self.shard_mod.generate_initial)
+
+        # バッチ分散を想定するなら in_specs に P("dp") 等を当てるが、
+        # ここでは「形だけ保持」。単一コアでは JIT フォールバック。
+        if jax.device_count() > 1:
+            self.init_shmap = jax.jit(
+                shard_map(
+                    _gen_init_fn,
+                    in_specs=(P(), P(), None),
+                    out_specs=(P(), P()),
+                    mesh=self.mesh
+                ),
+                static_argnames=("gen_len",),
+            )
+        else:
+            self.init_shmap = jax.jit(_gen_init_fn, static_argnames=("gen_len",))
+
+        # ===== shmap: decode_once =====
+        def _gen_once_fn(params, new_tok_1d, state_tuple):
+            return self.shard_mod.apply(params, new_tok_1d, state_tuple, method=self.shard_mod.generate_once)
 
         if jax.device_count() > 1:
-            vmapped_fn = jax.vmap(init_fn, in_axes=(0, None))  # Vmap RNG over multiple devices
-        else:                
-            vmapped_fn = init_fn  # No need to vmap on a single core
-
-        print(f"Using {'vmap' if jax.device_count() > 1 else 'direct'} execution for init_fn.")
-        # Initialize state with shard_map
-        # print(f"Keys passed to shard_map: {rng.shape}")  # Should print (2,) in single-core mode
-
-        print(mesh_manager.get_mesh())
-
-        # Split the key for the total number of devices
-        total_devices = jax.device_count()  # This is 8 for TPU v2-8
-        rng = self.rng_manager.split_keys(total_devices if jax.device_count() > 1 else 1)
-        print(f"Shape of RNG keys before vmapped_fn: {rng.shape}")  # Should print (8, 2)
-        print(f"Base RNG shape: {self.rng_manager.get_current_key().shape}")
-        print(f"Split RNG shape: {rng.shape}")
-        
-        # Now print rng shape before shard_map
-        print(f"Keys passed to shard_map: {rng.shape}")  # Debug
-        
-        self.init_shmap = jax.jit(shard_map(
-            vmapped_fn,
-            in_specs=(P() if jax.device_count() == 1 else P('core', 'mp'), P()),  
-            out_specs=(P() if jax.device_count() == 1 else P('core', 'mp'), P()),  
-            mesh=mesh_manager.get_mesh()
-        ))
-
-
-        #x = jnp.zeros((self.config["seq"], 1), dtype=jnp.uint32)  # Reduce the batch size to match mp
-        # Only initialize if not in inference-only mode
-        if not inference_only:
-            x = jnp.zeros((1024, 1), dtype=jnp.uint32)  # ✅ reduce memory load
-            self.init_shmap(rng, x)
-            print("init_shmap executed")
+            self.decode_shmap = jax.jit(
+                shard_map(
+                    _gen_once_fn,
+                    in_specs=(P(), P(), P()),
+                    out_specs=(P(), P()),
+                    mesh=self.mesh
+                )
+            )
         else:
-            print("Skipped init_shmap (inference_only=True)")
+            self.decode_shmap = jax.jit(_gen_once_fn)
+
+
+
 
         
         def train_fn(state, ctx, tgt):
