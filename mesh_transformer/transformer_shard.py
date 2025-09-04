@@ -13,7 +13,7 @@ from .layers import (
     LayerCfg,
     ProjectionShard,
     TransformerLayerShard,
-    #ReplicatedLayerNorm,  # optional export
+    ReplicatedLayerNorm,  # optional export
 )
 
 
