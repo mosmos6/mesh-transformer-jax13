@@ -237,7 +237,5 @@ class CausalTransformer:
         else:
             return self._step_fn(params_fd, new_tok_B, state_tuple)
 
-    jax.debug.print(
-        "[kv] shapes k:{k} v:{v} cur:{c}",
-        k=state[0]['k'].shape, v=state[0]['v'].shape, c=state[0]['cur_index'])
+jax.debug.print("[kv] shapes k:{k} v:{v} cur:{c}", k=state[0]['k'].shape, v=state[0]['v'].shape, c=state[0]['cur_index'])
 
