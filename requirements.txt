@@ -13,7 +13,6 @@ typing-extensions
 google-api-core[grpc]
 fabric
 optax
-dm-haiku
 ray[default]
 ray
 jax
