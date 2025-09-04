@@ -1,339 +1,290 @@
+# mesh_transformer/layers.py
 # -*- coding: utf-8 -*-
-# layers.py — Flax linen 実装（delta 返却 / TBHD KV / RoPE=64 / FFN f32）
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
+from flax import linen as nn
 
-# ------------------------------------------------------------
-#  LayerNorm（パラメータ名を leafspec に合わせる: scale / offset）
-#  - 計算は f32、出力は bf16（元 dtype を尊重）
-# ------------------------------------------------------------
-class OffsetScaleLayerNorm(nn.Module):
-    features: int
+
+# --------------------------
+# Utility: LayerNorm (scale/offset 命名)
+# --------------------------
+class ReplicatedLayerNorm(nn.Module):
+    """Param 名を leafspec に合わせる: {scale, offset}。eps は標準値。"""
     eps: float = 1e-5
 
     @nn.compact
-    def __call__(self, x):
-        x_dtype = x.dtype
-        x = x.astype(jnp.float32)
-        mean = jnp.mean(x, axis=-1, keepdims=True)
-        var  = jnp.mean((x - mean) ** 2, axis=-1, keepdims=True)
-        inv_std = jax.lax.rsqrt(var + self.eps)
-
-        scale  = self.param("scale",  nn.initializers.ones,  (self.features,), jnp.bfloat16)
-        offset = self.param("offset", nn.initializers.zeros, (self.features,), jnp.bfloat16)
-
-        y = (x - mean) * inv_std
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        d = x.shape[-1]
+        scale = self.param("scale", nn.initializers.ones, (d,))
+        offset = self.param("offset", nn.initializers.zeros, (d,))
+        x32 = x.astype(jnp.float32)
+        mean = jnp.mean(x32, axis=-1, keepdims=True)
+        var = jnp.var(x32, axis=-1, keepdims=True)
+        y = (x32 - mean) * jax.lax.rsqrt(var + self.eps)
         y = y * scale.astype(jnp.float32) + offset.astype(jnp.float32)
-        return y.astype(x_dtype)
+        return y.astype(x.dtype)
 
 
-# ------------------------------------------------------------
-#  Embedding
-#  - /embed/embed_layer/embedding
-# ------------------------------------------------------------
-class EmbeddingShard(nn.Module):
-    config: dict
-    mesh: object | None = None
+# --------------------------
+# Rotary Positional Embedding (RoPE=64)
+# --------------------------
+def _rope_rotate_half(x: jnp.ndarray) -> jnp.ndarray:
+    # (..., rot/2, 2) → (..., rot)
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return jnp.stack((-x2, x1), axis=-1).reshape(x.shape)
 
-    def setup(self):
-        self.embed_layer = nn.Embed(
-            num_embeddings=self.config["n_vocab"],
-            features=self.config["d_model"],
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-            name="embed_layer",
-        )
+def apply_rope(q: jnp.ndarray,
+               k: jnp.ndarray,
+               pos: jnp.ndarray,
+               rotary_dim: int,
+               base: float = 10000.0) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """
+    q,k: (B,T,H,Dh) または (B,1,H,Dh)
+    pos: 位置インデックス int32（T,）または（1,）
+    rotary_dim: 先頭 Dh のうち適用する次元（GPT‑J: 64）
+    """
+    Dh = q.shape[-1]
+    rot = rotary_dim
+    assert rot <= Dh and (rot % 2 == 0), "rotary_dim must be even and <= d_head"
 
-    def __call__(self, xBT):
-        # 入力は (B,T) または (T,) を許容
-        if xBT.ndim == 1:
-            xBT = xBT[None, :]
-        return self.embed_layer(xBT)  # -> (B,T,D) bf16
+    # inv_freq: (rot/2,)
+    inv_freq = 1.0 / (base ** (jnp.arange(0, rot, 2, dtype=jnp.float32) / rot))  # (rot/2,)
 
+    # pos: (..., 1) として outer
+    pos = pos.astype(jnp.float32).reshape((-1, 1))
+    # (..., rot/2)
+    freqs = pos * inv_freq[None, :]
+    # (..., rot)
+    cos = jnp.repeat(jnp.cos(freqs), 2, axis=-1)
+    sin = jnp.repeat(jnp.sin(freqs), 2, axis=-1)
 
-# ------------------------------------------------------------
-#  出力投影（最終 LN + Dense）
-#  - /proj/ReplicatedLayerNorm_0/{scale,offset}
-#  - /proj/Dense_0/{kernel,bias}
-# ------------------------------------------------------------
-class ProjectionShard(nn.Module):
-    config: dict
-    mesh: object | None = None
+    # ブロードキャスト: T or 1 を B,H 軸へ
+    while cos.ndim < q.ndim:
+        cos = cos[:, None, ...]
+        sin = sin[:, None, ...]
 
-    def setup(self):
-        D = self.config["d_model"]
-        V = self.config["n_vocab"]
-        # leafspec と同名: /proj/ReplicatedLayerNorm_0/*
-        self.ReplicatedLayerNorm_0 = OffsetScaleLayerNorm(D, name="ReplicatedLayerNorm_0")
-        # 計算 dtype は f32（安定化）、param は bf16（leafspec）
-        self.Dense_0 = nn.Dense(
-            V, use_bias=True,
-            dtype=jnp.float32,       # matmul 出力を f32
-            param_dtype=jnp.bfloat16,
-            name="Dense_0"
-        )
+    def _apply(x):
+        x_rot = x[..., :rot]
+        x_pass = x[..., rot:]
+        x_rot = x_rot * cos + _rope_rotate_half(x_rot) * sin
+        return jnp.concatenate([x_rot, x_pass], axis=-1)
 
-    def __call__(self, xBTD):
-        x = self.ReplicatedLayerNorm_0(xBTD)  # (B,T,D) bf16
-        x = x.astype(jnp.float32)
-        logits = self.Dense_0(x)              # (B,T,V) f32
-        return logits
+    return _apply(q), _apply(k)
 
 
-# ------------------------------------------------------------
-#  相対位置（本件は rotary を使うのでダミー）
-# ------------------------------------------------------------
-class RelativePositionEmbs(nn.Module):
+# --------------------------
+# Dense (bias 有/無) ただし名前は leafspec に合わせる
+# --------------------------
+class DenseNoBias(nn.Module):
+    features: int
+    name: Optional[str] = None
+
     @nn.compact
-    def __call__(self, q_len, k_len, n_heads):
-        # 互換のため 0.0 を返す
-        return 0.0
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        return nn.Dense(self.features, use_bias=False, name=self.name)(x)
+
+class DenseBias(nn.Module):
+    features: int
+    name: Optional[str] = None
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        return nn.Dense(self.features, use_bias=True, name=self.name)(x)
 
 
-# ------------------------------------------------------------
-#  RoPE (rotary position embedding) ユーティリティ
-#  - GPT-J 想定: 先頭 pe_rotary_dims (=64) のみ回転、偶奇ペア
-#  - 事前計算形: (T, rotary/2) の cos/sin を作り、内部で (1,T,1,rot/2) にブロードキャスト
-#  - 単ステップ形: (rot/2,) から (1,1,1,rot/2)
-# ------------------------------------------------------------
-def _rope_inv_freq(rotary_dims: int):
-    dim = rotary_dims
-    inv_freq = 1.0 / (10000 ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-    return inv_freq  # (rot/2,)
+# --------------------------
+# Embedding (/embed/embed_layer/embedding)
+# --------------------------
+class _EmbedLayer(nn.Module):
+    n_vocab: int
+    d_model: int
 
-def rope_table(T: int, rotary_dims: int):
-    inv = _rope_inv_freq(rotary_dims)              # (rot/2,)
-    pos = jnp.arange(T, dtype=jnp.float32)[:, None]  # (T,1)
-    ang = pos * inv[None, :]                        # (T, rot/2)
-    return jnp.cos(ang), jnp.sin(ang)               # (T, rot/2)
+    @nn.compact
+    def __call__(self, ids: jnp.ndarray) -> jnp.ndarray:
+        # ids: (B,T) または (T,) または (1,)
+        emb = self.param("embedding", nn.initializers.normal(stddev=0.02),
+                         (self.n_vocab, self.d_model))
+        x = jnp.take(emb, ids, axis=0)
+        return x
 
-def rope_single(pos_index: int, rotary_dims: int):
-    inv = _rope_inv_freq(rotary_dims)               # (rot/2,)
-    ang = (jnp.float32(pos_index)) * inv            # (rot/2,)
-    return jnp.cos(ang), jnp.sin(ang)               # (rot/2,)
+class EmbedBlock(nn.Module):
+    n_vocab: int
+    d_model: int
 
-def apply_rope_qk(q, k, cos, sin, rotary_dims: int, single_step: bool = False):
-    """
-    q,k: (..., H, Dh) ここで Dh>=rotary_dims
-    cos,sin:
-      - 連番時: (T, rot/2)
-      - 単ステップ: (rot/2,)
-    出力: q', k'（同形状）
-    """
-    R = rotary_dims
-    q_rot, q_pass = q[..., :R], q[..., R:]
-    k_rot, k_pass = k[..., :R], k[..., R:]
-
-    # 偶奇分離
-    def _even(x): return x[..., ::2]
-    def _odd (x): return x[..., 1::2]
-
-    if single_step:
-        # (rot/2,) -> (1,1,1,rot/2)
-        cos = cos.reshape((1, 1, 1, -1))
-        sin = sin.reshape((1, 1, 1, -1))
-    else:
-        # (T,rot/2) -> (1,T,1,rot/2)  … (B,T,H,rot/2) へ自然ブロードキャスト
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
-
-    # q
-    q_even = _even(q_rot)
-    q_odd  = _odd (q_rot)
-    q_rot2 = jnp.stack([
-        q_even * cos - q_odd * sin,
-        q_odd  * cos + q_even * sin
-    ], axis=-1).reshape(q_rot.shape)
-
-    # k
-    k_even = _even(k_rot)
-    k_odd  = _odd (k_rot)
-    k_rot2 = jnp.stack([
-        k_even * cos - k_odd * sin,
-        k_odd  * cos + k_even * sin
-    ], axis=-1).reshape(k_rot.shape)
-
-    q_out = jnp.concatenate([q_rot2, q_pass], axis=-1)
-    k_out = jnp.concatenate([k_rot2, k_pass], axis=-1)
-    return q_out, k_out
+    @nn.compact
+    def __call__(self, ids: jnp.ndarray) -> jnp.ndarray:
+        # 名前を leafspec に合わせるため 2 段に分ける
+        embed_layer = _EmbedLayer(self.n_vocab, self.d_model, name="embed_layer")
+        return embed_layer(ids)
 
 
-# ------------------------------------------------------------
-#  Transformer Layer（delta 返却 / KV=TBHD）
-#  - 1LN 並列残差: delta = Attn(LN(x)) + MLP(LN(x))
-#  - get_init_decode_state:  全長で delta を返しつつ、KV=TBHD と cur_index=T を返す
-#  - decode_once:            1 トークン分の delta と KV 更新
-# ------------------------------------------------------------
+# --------------------------
+# Transformer Layer (pre‑LN, 自己注意 + MLP)
+#   params path:
+#     /transformer_layers_{i}/norm/{scale,offset}
+#     /transformer_layers_{i}/{q,k,v,o}/kernel
+#     /transformer_layers_{i}/dense_proj{,_o}/{kernel,bias}
+# --------------------------
+@dataclass
+class LayerCfg:
+    d_model: int
+    n_heads: int
+    d_head: int
+    rotary_dim: int
+
 class TransformerLayerShard(nn.Module):
-    config: dict
-    mesh: object | None = None
+    cfg: LayerCfg
+    name: Optional[str] = None  # 外側で transformer_layers_i 指定
 
     def setup(self):
-        D  = self.config["d_model"]
-        H  = self.config["n_heads"]
-        Dh = self.config["d_head"]
+        D = self.cfg.d_model
+        H = self.cfg.n_heads
+        # pre-LN
+        self.norm = ReplicatedLayerNorm(name="norm")
+        # Attention (bias なし)
+        self.q = DenseNoBias(D, name="q")
+        self.k = DenseNoBias(D, name="k")
+        self.v = DenseNoBias(D, name="v")
+        self.o = DenseNoBias(D, name="o")
+        # MLP (bias あり)
+        self.ff1 = DenseBias(4 * D, name="dense_proj")
+        self.ff2 = DenseBias(D, name="dense_proj_o")
 
-        self.D, self.H, self.Dh = D, H, Dh
-        self.pe_rotary_dims = int(self.config.get("pe_rotary_dims", 0))
-        self.scale = jnp.float32(Dh) ** -0.5
-
-        # 単一 LN（leafspec: /transformer_layers_*/norm/{scale,offset}）
-        self.norm = OffsetScaleLayerNorm(D, name="norm")
-
-        # Q K V O（leafspec に合わせて属性名を付ける）
-        self.q = nn.Dense(
-            D, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="q"
-        )
-        self.k = nn.Dense(
-            D, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="k"
-        )
-        self.v = nn.Dense(
-            D, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="v"
-        )
-        self.o = nn.Dense(
-            D, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, name="o"
-        )
-
-        # MLP（FFN は f32 計算で安定化）
-        self.dense_proj = nn.Dense(
-            4 * D, use_bias=True, dtype=jnp.float32, param_dtype=jnp.bfloat16, name="dense_proj"
-        )
-        self.dense_proj_o = nn.Dense(
-            D, use_bias=True, dtype=jnp.float32, param_dtype=jnp.bfloat16, name="dense_proj_o"
-        )
-
-    # ---- 内部ユーティリティ ----
-    def _split_heads(self, xBTD):
+    # ---- full-seq (context) ----
+    def attend_full(self, xBTD: jnp.ndarray) -> jnp.ndarray:
+        """x:(B,T,D) -> (B,T,D), 事前に pre-LN 済み想定"""
         B, T, D = xBTD.shape
-        H, Dh = self.H, self.Dh
-        return xBTD.reshape(B, T, H, Dh)
+        H = self.cfg.n_heads
+        Dh = self.cfg.d_head
+        rot = self.cfg.rotary_dim
 
-    def _merge_heads(self, xBTHD):
-        B, T, H, Dh = xBTHD.shape
-        return xBTHD.reshape(B, T, H * Dh)
+        # Q,K,V: (B,T,D) -> (B,T,H,Dh)
+        qBTD = self.q(xBTD)
+        kBTD = self.k(xBTD)
+        vBTD = self.v(xBTD)
+        qBTHD = qBTD.reshape(B, T, H, Dh)
+        kBTHD = kBTD.reshape(B, T, H, Dh)
+        vBTHD = vBTD.reshape(B, T, H, Dh)
 
-    def _causal_mask(self, T):
-        # (T,T) 上三角（対角より上）に -1e10
-        m = jnp.triu(jnp.ones((T, T), dtype=bool), 1)
-        return jnp.where(m, jnp.float32(-1e10), jnp.float32(0.0))  # (T,T)
+        # RoPE（位置 0..T-1）
+        pos = jnp.arange(T, dtype=jnp.int32)
+        qBTHD, kBTHD = apply_rope(qBTHD, kBTHD, pos, rotary_dim=rot)
 
-    def _attn_parallel_delta(self, xBTD):
-        """
-        並列残差: delta = Attn(LN(x)) + MLP(LN(x))
-        ここではフル長（B,T,D）を想定し、自己注意 & causal mask を適用。
-        KV を返すのは get_init_decode_state 側。
-        """
-        B, T, _ = xBTD.shape
-        D, H, Dh = self.D, self.H, self.Dh
+        # scaled dot-prod attn
+        scale = 1.0 / jnp.sqrt(jnp.float32(Dh))
+        # scores: (B,H,T,T)
+        scores = jnp.einsum("bthd,bshd->bhts", qBTHD, kBTHD) * scale
+        # causal mask
+        mask = jnp.tril(jnp.ones((T, T), dtype=bool))
+        mask = jnp.where(mask, 0.0, -1e9).astype(scores.dtype)
+        scores = scores + mask
 
-        x_norm = self.norm(xBTD)                    # (B,T,D) bf16
-        # --- QKV（bf16）→ f32 に上げて内積
-        q = self._split_heads(self.q(x_norm))       # (B,T,H,Dh) bf16
-        k = self._split_heads(self.k(x_norm))       # (B,T,H,Dh) bf16
-        v = self._split_heads(self.v(x_norm))       # (B,T,H,Dh) bf16
+        w = jax.nn.softmax(scores, axis=-1)  # (B,H,T,T)
+        ctx = jnp.einsum("bhts,bshd->bthd", w, vBTHD)  # (B,T,H,Dh)
+        outBTD = self.o(ctx.reshape(B, T, D))          # (B,T,D)
+        return outBTD
 
-        # RoPE（先頭 pe_rotary_dims のみ）
-        if self.pe_rotary_dims > 0:
-            cos, sin = rope_table(T, self.pe_rotary_dims)        # (T,rot/2)
-            q, k = apply_rope_qk(q, k, cos, sin, self.pe_rotary_dims, single_step=False)
-
-        q32 = q.astype(jnp.float32)
-        k32 = k.astype(jnp.float32)
-        v32 = v.astype(jnp.float32)
-
-        # 注意スコア: (B,H,T,T)
-        attn_scores = jnp.einsum("bthd,bshd->bhts", q32, k32) * self.scale
-        attn_scores = attn_scores + self._causal_mask(T)[None, None, :, :]
-        attn = jax.nn.softmax(attn_scores, axis=-1)
-
-        ctx = jnp.einsum("bhts,bshd->bthd", attn, v32)           # (B,T,H,Dh) f32
-        attn_out = self.o(self._merge_heads(ctx).astype(jnp.bfloat16))  # (B,T,D) bf16
-
-        # MLP（f32 計算 → bf16 戻し）
-        h = self.dense_proj(x_norm.astype(jnp.float32))          # (B,T,4D) f32
+    def mlp_block(self, xBTD: jnp.ndarray) -> jnp.ndarray:
+        """MLP は『計算だけ f32 → 出力だけ元 dtype(bf16)』"""
+        x32 = xBTD.astype(jnp.float32)
+        h = self.ff1(x32)          # (B,T,4D)
         h = jax.nn.gelu(h)
-        h = self.dense_proj_o(h)                                 # (B,T,D) f32
-        mlp_out = h.astype(jnp.bfloat16)
+        y = self.ff2(h)            # (B,T,D)
+        return y.astype(xBTD.dtype)
 
-        delta = (attn_out.astype(jnp.float32) + mlp_out.astype(jnp.float32)).astype(jnp.bfloat16)
-        return delta, (k, v)   # delta=(B,T,D), KV=(B,T,H,Dh)
+    @nn.compact
+    def __call__(self, xBTD: jnp.ndarray) -> jnp.ndarray:
+        # pre-LN
+        xn = self.norm(xBTD)
+        attn = self.attend_full(xn)
+        x = xBTD + attn
+        # FFN（pre-LN）
+        xn2 = self.norm(x)
+        ff = self.mlp_block(xn2)
+        return x + ff
 
-    # ---- 呼び出し（全長）: delta を返す ----
-    def __call__(self, xBTD, attn_bias, layer_index, state=None):
-        delta, _ = self._attn_parallel_delta(xBTD)
-        return delta  # (B,T,D) bf16
-
-    # ---- 初期デコード: KV 構築（TBHD）+ delta 返却 ----
-    def get_init_decode_state(self, xBTD, given_length: int, attn_bias, mesh_manager=None):
+    # ---- decode_once (KV 使用) ----
+    def decode_once(self,
+                    decode_state: Dict[str, Any],
+                    xB1D: jnp.ndarray) -> Tuple[jnp.ndarray, Dict[str, Any]]:
         """
-        xBTD: (B,T,D)
-        戻り値:
-          delta: (B,T,D)
-          state: {"k": (T,B,H,Dh), "v": (T,B,H,Dh), "cur_index": T}
+        decode_state: {'k':(Ttot,B,H,Dh), 'v':同, 'cur_index': scalar int32}
+        xB1D: (B,1,D)  事前に pre-LN 済み想定
+        返り: (deltaB1D, new_state)
         """
-        delta, (kBTHD, vBTHD) = self._attn_parallel_delta(xBTD)      # (B,T,H,Dh)
-        # KV を TBHD に並べ替え
-        kTBHD = jnp.swapaxes(kBTHD, 0, 1)    # (T,B,H,Dh)
-        vTBHD = jnp.swapaxes(vBTHD, 0, 1)
-        B, T, _ = xBTD.shape
-        state = {
-            "k": kTBHD,
-            "v": vTBHD,
-            "cur_index": jnp.array(T, dtype=jnp.int32)   # 既存長
-        }
-        return delta, state
+        B, _, D = xB1D.shape
+        H = self.cfg.n_heads
+        Dh = self.cfg.d_head
+        rot = self.cfg.rotary_dim
 
-    # ---- 単ステップ decode: 1 トークンの delta と KV 追記 ----
-    def decode_once(self, decode_state, xB1D, attn_bias):
-        """
-        decode_state: {"k": (T,B,H,Dh), "v": (T,B,H,Dh), "cur_index": int32}
-        xB1D: (B,1,D)
-        戻り値:
-          delta: (B,1,D)
-          new_state: 同上（T->T+1）
-        """
-        kTBHD, vTBHD = decode_state["k"], decode_state["v"]
-        cur = int(decode_state["cur_index"])
-        B = xB1D.shape[0]
+        kTBHD: jnp.ndarray = decode_state["k"]
+        vTBHD: jnp.ndarray = decode_state["v"]
+        cur: jnp.ndarray = decode_state["cur_index"]  # int32 scalar
+        Ttot = kTBHD.shape[0]
 
-        x_norm = self.norm(xB1D)                                 # (B,1,D)
-        q = self._split_heads(self.q(x_norm))                    # (B,1,H,Dh)
-        k = self._split_heads(self.k(x_norm))                    # (B,1,H,Dh)
-        v = self._split_heads(self.v(x_norm))                    # (B,1,H,Dh)
+        # Q/K/V（1 ステップ）
+        qB1D = self.q(xB1D)
+        kB1D = self.k(xB1D)
+        vB1D = self.v(xB1D)
+        qBHd = qB1D.reshape(B, 1, H, Dh)
+        kBHd = kB1D.reshape(B, 1, H, Dh)
+        vBHd = vB1D.reshape(B, 1, H, Dh)
 
-        # RoPE: 単ステップ（現在位置=cur）
-        if self.pe_rotary_dims > 0:
-            cos1, sin1 = rope_single(cur, self.pe_rotary_dims)   # (rot/2,)
-            q, k = apply_rope_qk(q, k, cos1, sin1, self.pe_rotary_dims, single_step=True)
+        # RoPE（位置=cur）
+        qBHd, kBHd = apply_rope(qBHd, kBHd, pos=cur.reshape((1,)), rotary_dim=rot)
 
-        # KV 追記（TBHD）
-        k_step_TBHD = jnp.swapaxes(k, 0, 1)  # (1,B,H,Dh)
-        v_step_TBHD = jnp.swapaxes(v, 0, 1)
-        kTBHD_new = jnp.concatenate([kTBHD, k_step_TBHD], axis=0)  # (T+1,B,H,Dh)
-        vTBHD_new = jnp.concatenate([vTBHD, v_step_TBHD], axis=0)
+        # K/V キャッシュへ write（cur は tracer なので dynamic_update を使う）
+        # kTBHD: (Ttot,B,H,Dh)
+        kTBHD = jax.lax.dynamic_update_slice(kTBHD, kBHd, (cur, 0, 0, 0))
+        vTBHD = jax.lax.dynamic_update_slice(vTBHD, vBHd, (cur, 0, 0, 0))
 
-        # 注意（q against 全キー）
-        kBTHD = jnp.swapaxes(kTBHD_new, 0, 1).astype(jnp.float32)  # (B,T+1,H,Dh)
-        vBTHD = jnp.swapaxes(vTBHD_new, 0, 1).astype(jnp.float32)  # (B,T+1,H,Dh)
-        q32 = q.astype(jnp.float32)
+        # scores: (B,H,Ttot)  全長に対して計算し、mask で cur 以降を切る
+        scale = 1.0 / jnp.sqrt(jnp.float32(Dh))
+        # einsum: (B,1,H,Dh) x (T,B,H,Dh) -> (B,H,T)
+        scores = jnp.einsum("bthd,tbhd->bht", qBHd, kTBHD) * scale
+        # mask: pos <= cur のみ有効
+        pos = jnp.arange(Ttot, dtype=jnp.int32)  # (Ttot,)
+        valid = (pos[None, None, :] <= cur[None, None])  # (1,1,Ttot)
+        scores = jnp.where(valid, scores, scores.dtype.type(-1e9))
+        w = jax.nn.softmax(scores, axis=-1)  # (B,H,Ttot)
 
-        scores = jnp.einsum("b1hd,bthd->bh1t", q32, kBTHD) * self.scale  # (B,H,1,T+1)
-        attn  = jax.nn.softmax(scores, axis=-1)
-        ctx   = jnp.einsum("bh1t,bthd->b1hd", attn, vBTHD)               # (B,1,H,Dh)
-        attn_out = self.o(self._merge_heads(ctx).astype(jnp.bfloat16))   # (B,1,D) bf16
+        ctx = jnp.einsum("bht,tbhd->bhd", w, vTBHD)  # (B,H,Dh)
+        out = self.o(ctx.reshape(B, 1, D))           # (B,1,D)
 
-        # MLP（f32）
-        h = self.dense_proj(x_norm.astype(jnp.float32))
-        h = jax.nn.gelu(h)
-        h = self.dense_proj_o(h)                                          # (B,1,D) f32
-        mlp_out = h.astype(jnp.bfloat16)
+        new_state = {"k": kTBHD, "v": vTBHD, "cur_index": cur + jnp.int32(1)}
+        return out, new_state
 
-        delta = (attn_out.astype(jnp.float32) + mlp_out.astype(jnp.float32)).astype(jnp.bfloat16)
+    # for convenience
+    def init_decode_state(self, total_len: int, batch: int) -> Dict[str, Any]:
+        H = self.cfg.n_heads
+        Dh = self.cfg.d_head
+        k = jnp.zeros((total_len, batch, H, Dh), dtype=jnp.bfloat16)
+        v = jnp.zeros((total_len, batch, H, Dh), dtype=jnp.bfloat16)
+        return {"k": k, "v": v, "cur_index": jnp.int32(0)}
 
-        new_state = {
-            "k": kTBHD_new,
-            "v": vTBHD_new,
-            "cur_index": jnp.array(cur + 1, dtype=jnp.int32),
-        }
-        return delta, new_state
+
+# --------------------------
+# Projection (/proj/…)
+#   /proj/ReplicatedLayerNorm_0/{scale,offset}
+#   /proj/Dense_0/{kernel,bias}
+# --------------------------
+class ProjectionShard(nn.Module):
+    d_model: int
+    n_vocab: int
+
+    def setup(self):
+        # 名前は leafspec に合わせる
+        self.layer_norm = ReplicatedLayerNorm(name="ReplicatedLayerNorm_0")
+        self.out = DenseBias(self.n_vocab, name="Dense_0")
+
+    @nn.compact
+    def __call__(self, xB1D: jnp.ndarray) -> jnp.ndarray:
+        # pre-LN → Dense  （b のゼロ中心化は外でパラメータを書き換えても可）
+        xn = self.layer_norm(xB1D)
+        return self.out(xn)
