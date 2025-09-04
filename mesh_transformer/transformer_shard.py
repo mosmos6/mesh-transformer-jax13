@@ -117,20 +117,7 @@ class _CausalTransformerCore(nn.Module):
         rng = jax.random.PRNGKey(0)  # dropout なしだが形だけ保持
         return logits_last, (last_tok, tuple(states), rng)
 
-    def _tap_state(tag, st):
-        k = st[0]['k']; v = st[0]['v']; ci = st[0].get('cur_index', None)
-        jax.debug.print(
-            "[{t}] k {ks}, v {vs}, cur_index {ci}", t=tag,
-            ks=k.shape, vs=v.shape, ci=ci if ci is not None else jnp.array(-1, jnp.int32)
-        )
-
-    # After jit_init:
-    jax.debug.callback(lambda st: _tap_state("init", st), state)
     
-    # After one jit_step:
-    logits, (last, state, rng) = jit_step(params_fd, last_tok, (last, state, rng))
-    jax.debug.callback(lambda st: _tap_state("after1", st), state)
-
 
     # ============ 1 ステップ decode ============
     def generate_once(self, new_tok_1d: jnp.ndarray, state_tuple):
