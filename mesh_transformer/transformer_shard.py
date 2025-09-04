@@ -120,6 +120,11 @@ class CausalTransformerShard(nn.Module):
         rng = jax.random.PRNGKey(0)          # 生成側の契約維持（未使用でも形は返す）
         return logitsB1V, (last_tokB, tuple(states), rng)
 
+    jax.debug.print(
+    "[kv] shapes k:{k} v:{v} cur:{c}",
+    k=state[0]['k'].shape, v=state[0]['v'].shape, c=state[0]['cur_index'])
+
+
     # -------------------------------------------------------------------------
     # 1 トークン step デコード（KV 使用）
     # 入力: new_tok_B (B,), states (tuple of dict)
@@ -233,3 +238,8 @@ class CausalTransformer:
             return fn(params_fd, new_tok_B, state_tuple)
         else:
             return self._step_fn(params_fd, new_tok_B, state_tuple)
+
+    jax.debug.print(
+        "[kv] shapes k:{k} v:{v} cur:{c}",
+        k=state[0]['k'].shape, v=state[0]['v'].shape, c=state[0]['cur_index'])
+
