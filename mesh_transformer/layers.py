@@ -320,7 +320,7 @@ class TransformerLayerShard(nn.Module):
         # back to (B,T,D)
         ctxBTD = jnp.transpose(ctxBHTD, (0, 2, 1, 3)).reshape(B, T, D)
         attn_out = self.o(ctxBTD)
-        return out
+        return attn_out
 
     # -------- MLP
     @nn.compact
