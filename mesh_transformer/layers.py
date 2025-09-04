@@ -336,7 +336,7 @@ class TransformerLayerShard(nn.Module):
         return _to_out_dtype(xBTD, y)
 
     # --- KV 初期化（TBHD: (T, B, H, Dh)） ---
-    @nn.compact
+    
     def init_decode_state(self, total_len: int, batch: int) -> Dict[str, jnp.ndarray]:
         H, Dh = self.n_heads, self.d_head
         k = jnp.zeros((total_len, batch, H, Dh), dtype=jnp.bfloat16)
