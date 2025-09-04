@@ -143,7 +143,7 @@ def merge_heads(xBTHD: jnp.ndarray) -> jnp.ndarray:
 # -----------------------------
 # Transformer layer
 # -----------------------------
-class TransformerLayer(nn.Module):
+class TransformerLayerShard(nn.Module):
     cfg: LayerCfg
 
     def setup(self):
