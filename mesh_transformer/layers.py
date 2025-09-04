@@ -101,6 +101,21 @@ class ReplicatedLayerNorm(nn.Module):
         y = y * _to_f32(scale) + _to_f32(offset)
         return _to_out_dtype(x, y)
 
+class _PreLayerNorm(nn.Module):
+    epsilon: float = 1e-6
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        d = x.shape[-1]
+        scale = self.param('scale', nn.initializers.ones, (d,), jnp.bfloat16)
+        offset = self.param('offset', nn.initializers.zeros, (d,), jnp.bfloat16)
+        x32 = x.astype(jnp.float32)
+        mu = jnp.mean(x32, axis=-1, keepdims=True)
+        var = jnp.mean((x32 - mu) ** 2, axis=-1, keepdims=True)
+        y = (x32 - mu) * jax.lax.rsqrt(var + jnp.array(self.epsilon, x32.dtype))
+        y = y * scale.astype(jnp.float32) + offset.astype(jnp.float32)
+        return y.astype(x.dtype)
+
+
 
 # --------------------------
 # Rotary positional embedding utilities
@@ -211,11 +226,21 @@ class TransformerLayerShard(nn.Module):
         # 互換エイリアス（古い呼び出し側が rotary_dim を期待しても動くように）
         return self.cfg.pe_rotary_dims
 
+    @property
+    def pe(self) -> str:
+        return self.cfg.pe
+    
+    @property
+    def pe_rotary_dims(self) -> int:
+        return self.cfg.pe_rotary_dims
+
+
 
     # -------- LayerNorm inside layer: params under "/transformer_layers_*/norm/{offset,scale}"
     @nn.compact
     def norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return ReplicatedLayerNorm(name='norm')(x)
+        return _PreLayerNorm(name='norm')(x)
+
 
 
     # -------- Full attention (prefix)
@@ -225,9 +250,10 @@ class TransformerLayerShard(nn.Module):
         H, Dh = self.n_heads, self.d_head
         assert D == H * Dh, "d_model must equal n_heads * d_head"
 
-        q = DenseNoBias(D, name='q')(_to_f32(xBTD))
-        k = DenseNoBias(D, name='k')(_to_f32(xBTD))
-        v = DenseNoBias(D, name='v')(_to_f32(xBTD))
+        q = nn.Dense(D, use_bias=False, name='q')(_to_f32(xBTD))
+        k = nn.Dense(D, use_bias=False, name='k')(_to_f32(xBTD))
+        v = nn.Dense(D, use_bias=False, name='v')(_to_f32(xBTD))
+
 
         # Reshape to (B,T,H,Dh)
         def to_BTHD(z):
@@ -267,7 +293,7 @@ class TransformerLayerShard(nn.Module):
         ctxBHTD = jnp.einsum('BHTS,BHSD->BHTD', probs, vBHTD)
         # back to (B,T,D)
         ctxBTD = jnp.transpose(ctxBHTD, (0, 2, 1, 3)).reshape(B, T, D)
-        out = DenseNoBias(D, name='o')(ctxBTD)
+        out = nn.Dense(D, use_bias=False, name='o')(_to_f32(ctxBTD))
         return out
 
     # -------- MLP
@@ -276,9 +302,9 @@ class TransformerLayerShard(nn.Module):
         D = xBTD.shape[-1]
         hidden = 4 * D
         # Dense -> GELU -> Dense ; all math in f32
-        h = DenseBias(hidden, name='dense_proj')(_to_f32(xBTD))
+        h = nn.Dense(hidden, use_bias=True, name='dense_proj')(_to_f32(xBTD))
         h = _gelu(h)
-        y = DenseBias(D, name='dense_proj_o')(h)
+        y = nn.Dense(D, use_bias=True, name='dense_proj_o')(_to_f32(h))
         return _to_out_dtype(xBTD, y)
 
     # -------- One-step decode using KV cache (state dict: {"k": TBHD, "v": TBHD, "cur_index": int32})
@@ -291,9 +317,9 @@ class TransformerLayerShard(nn.Module):
         assert D == H * Dh
 
         # Project new q, k, v
-        q = DenseNoBias(D, name='q')(_to_f32(xB1D))            # (B,1,D)
-        k_new = DenseNoBias(D, name='k')(_to_f32(xB1D))        # (B,1,D)
-        v_new = DenseNoBias(D, name='v')(_to_f32(xB1D))        # (B,1,D)
+        q = nn.Dense(D, use_bias=False, name='q')(_to_f32(xB1D))
+        k_new = nn.Dense(D, use_bias=False, name='k')(_to_f32(xB1D))
+        v_new = nn.Dense(D, use_bias=False, name='v')(_to_f32(xB1D))
 
         # reshape to (B,1,H,Dh)
         qB1HD = q.reshape(B, 1, H, Dh)
@@ -345,7 +371,7 @@ class TransformerLayerShard(nn.Module):
         ctxBH1D = jnp.einsum('BH1T,BHTD->BH1D', probs, vBHTD)  # (B,H,1,Dh)
         ctxB1HD = jnp.transpose(ctxBH1D, (0, 2, 1, 3))        # (B,1,H,Dh)
         ctxB1D = ctxB1HD.reshape(B, 1, D)                     # (B,1,D)
-        attn_out = DenseNoBias(D, name='o')(ctxB1D)           # (B,1,D)
+        attn_out = nn.Dense(D, use_bias=False, name='o')(_to_f32(ctxB1D))
 
         # Residual-add for MLP
         x_after_attn = xB1D + attn_out
