@@ -465,6 +465,7 @@ class TransformerLayerShard(nn.Module):
 
         # RoPE 単ステップ（pos=cur_index）
         cur = decode_state['cur_index']
+        write_idx = cur + jnp.array(1, dtype=cur.dtype)
         if self.pe == 'rotary' and self.pe_rotary_dims > 0:
             inv = _rope_freqs(self.pe_rotary_dims, dtype=jnp.float32)
             cos, sin = _rope_angles(cur.astype(jnp.float32)[None], inv)  # (1, half)
