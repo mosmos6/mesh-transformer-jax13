@@ -235,6 +235,39 @@ class TransformerLayerShard(nn.Module):
     def norm(self, x: jnp.ndarray) -> jnp.ndarray:
         return _PreLayerNorm(name='norm')(x)
 
+    # --- 投影を公開（transformer_shard が直接呼べるように） ---
+    @nn.compact
+    def q(self, xBTD: jnp.ndarray) -> jnp.ndarray:
+        D = xBTD.shape[-1]
+        return nn.Dense(D, use_bias=False, name='q')(xBTD.astype(jnp.float32))
+
+    @nn.compact
+    def k(self, xBTD: jnp.ndarray) -> jnp.ndarray:
+        D = xBTD.shape[-1]
+        return nn.Dense(D, use_bias=False, name='k')(xBTD.astype(jnp.float32))
+
+    @nn.compact
+    def v(self, xBTD: jnp.ndarray) -> jnp.ndarray:
+        D = xBTD.shape[-1]
+        return nn.Dense(D, use_bias=False, name='v')(xBTD.astype(jnp.float32))
+
+    @nn.compact
+    def o(self, xBTD: jnp.ndarray) -> jnp.ndarray:
+        D = xBTD.shape[-1]
+        return nn.Dense(D, use_bias=False, name='o')(xBTD.astype(jnp.float32))
+
+    @nn.compact
+    def dense_proj(self, xBTD: jnp.ndarray) -> jnp.ndarray:
+        D = xBTD.shape[-1]
+        hidden = 4 * D
+        return nn.Dense(hidden, use_bias=True, name='dense_proj')(xBTD.astype(jnp.float32))
+
+    @nn.compact
+    def dense_proj_o(self, xBTD: jnp.ndarray) -> jnp.ndarray:
+        D = xBTD.shape[-1]
+        return nn.Dense(D, use_bias=True, name='dense_proj_o')(xBTD.astype(jnp.float32))
+
+
 
 
     # -------- Full attention (prefix)
@@ -244,10 +277,9 @@ class TransformerLayerShard(nn.Module):
         H, Dh = self.n_heads, self.d_head
         assert D == H * Dh, "d_model must equal n_heads * d_head"
 
-        q = nn.Dense(D, use_bias=False, name='q')(_to_f32(xBTD))
-        k = nn.Dense(D, use_bias=False, name='k')(_to_f32(xBTD))
-        v = nn.Dense(D, use_bias=False, name='v')(_to_f32(xBTD))
-
+        q = self.q(xBTD)  # (B,T,D)
+        k = self.k(xBTD)
+        v = self.v(xBTD)
 
         # Reshape to (B,T,H,Dh)
         def to_BTHD(z):
@@ -287,7 +319,7 @@ class TransformerLayerShard(nn.Module):
         ctxBHTD = jnp.einsum('BHTS,BHSD->BHTD', probs, vBHTD)
         # back to (B,T,D)
         ctxBTD = jnp.transpose(ctxBHTD, (0, 2, 1, 3)).reshape(B, T, D)
-        out = nn.Dense(D, use_bias=False, name='o')(_to_f32(ctxBTD))
+        attn_out = self.o(ctxB1D)
         return out
 
     # -------- MLP
@@ -300,6 +332,39 @@ class TransformerLayerShard(nn.Module):
         h = _gelu(h)
         y = nn.Dense(D, use_bias=True, name='dense_proj_o')(_to_f32(h))
         return _to_out_dtype(xBTD, y)
+
+    # --- KV 初期化（TBHD: (T, B, H, Dh)） ---
+    @nn.compact
+    def init_decode_state(self, total_len: int, batch: int) -> Dict[str, jnp.ndarray]:
+        H, Dh = self.n_heads, self.d_head
+        k = jnp.zeros((total_len, batch, H, Dh), dtype=jnp.bfloat16)
+        v = jnp.zeros((total_len, batch, H, Dh), dtype=jnp.bfloat16)
+        cur = jnp.array(0, dtype=jnp.int32)
+        return {"k": k, "v": v, "cur_index": cur}
+
+    # --- prefix の K/V を一括生成（RoPE 済み） ---
+    @nn.compact
+    def prefill_kv(self, xBTD: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        B, T, D = xBTD.shape
+        H, Dh = self.n_heads, self.d_head
+        kBTD = self.k(xBTD)  # (B,T,D)
+        vBTD = self.v(xBTD)  # (B,T,D)
+        kBTHD = kBTD.reshape(B, T, H, Dh)
+        vBTHD = vBTD.reshape(B, T, H, Dh)
+
+        if self.pe == 'rotary' and self.pe_rotary_dims > 0:
+            inv = _rope_freqs(self.pe_rotary_dims, dtype=jnp.float32)
+            t_idx = jnp.arange(T, dtype=jnp.float32)
+            cos, sin = _rope_angles(t_idx, inv)  # (T, half)
+            cos = cos[None, :, None, :]  # (1,T,1,half)
+            sin = sin[None, :, None, :]  # (1,T,1,half)
+            kBTHD = _apply_rope(kBTHD.astype(jnp.float32), cos, sin, self.pe_rotary_dims)
+        # V は回転しない
+        kTBHD = jnp.transpose(kBTHD, (1, 0, 2, 3))  # (T,B,H,Dh)
+        vTBHD = jnp.transpose(vBTHD, (1, 0, 2, 3))  # (T,B,H,Dh)
+        return kTBHD.astype(jnp.bfloat16), vTBHD.astype(jnp.bfloat16)
+
+
 
     # -------- KV-cache initializer (state dict: {"k": TBHD, "v": TBHD, "cur_index": int32})
     # 注意: ここは @nn.compact を付けない（パラメタ生成が不要なため）
