@@ -319,7 +319,7 @@ class TransformerLayerShard(nn.Module):
         ctxBHTD = jnp.einsum('BHTS,BHSD->BHTD', probs, vBHTD)
         # back to (B,T,D)
         ctxBTD = jnp.transpose(ctxBHTD, (0, 2, 1, 3)).reshape(B, T, D)
-        attn_out = self.o(ctxB1D)
+        attn_out = self.o(ctxBTD)
         return out
 
     # -------- MLP
