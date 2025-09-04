@@ -42,28 +42,19 @@ def _gelu(x: jnp.ndarray) -> jnp.ndarray:
 # --------------------------
 
 class DenseNoBias(nn.Module):
-    """nn.Dense(use_bias=False) wrapper that computes in f32 and returns x.dtype."""
     features: int
-
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # Keep param name 'kernel'
-        kernel = self.param('kernel', nn.initializers.lecun_normal(), (x.shape[-1], self.features), jnp.bfloat16)
-        y = jnp.matmul(_to_f32(x), _to_f32(kernel))
-        return _to_out_dtype(x, y)
-
+    def __call__(self, x):
+        # leafspec: "/.../<wrapper>/Dense_0/{kernel}"
+        return nn.Dense(self.features, use_bias=False, name="Dense_0")(x)
 
 class DenseBias(nn.Module):
-    """nn.Dense(use_bias=True) wrapper that computes in f32 and returns x.dtype."""
     features: int
-
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        kernel = self.param('kernel', nn.initializers.lecun_normal(), (x.shape[-1], self.features), jnp.bfloat16)
-        bias = self.param('bias', nn.initializers.zeros, (self.features,), jnp.bfloat16)
-        y = jnp.matmul(_to_f32(x), _to_f32(kernel))
-        y = y + _to_f32(bias)
-        return _to_out_dtype(x, y)
+    def __call__(self, x):
+        # leafspec: "/.../<wrapper>/Dense_0/{kernel,bias}"
+        return nn.Dense(self.features, use_bias=True, name="Dense_0")(x)
+
 
 
 # --------------------------
@@ -192,7 +183,7 @@ class TransformerLayerShard(nn.Module):
       - decode_once(decode_state, xB1D, attn_bias) -> (deltaB1D, new_state)
     """
     cfg: LayerCfg
-    name: Optional[str] = None
+    
 
     # --- 互換用エイリアス（既存コードが self.n_heads 等を参照しても動くように） ---
     @property
