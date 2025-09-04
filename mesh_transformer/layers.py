@@ -191,11 +191,25 @@ class TransformerLayerShard(nn.Module):
       - mlp_block(x)    # MLP (B, T, D) -> (B, T, D)
       - decode_once(decode_state, xB1D, attn_bias) -> (deltaB1D, new_state)
     """
-    d_model: int
-    n_heads: int
-    d_head: int
-    pe: str = 'rotary'
-    pe_rotary_dims: int = 64
+    cfg: LayerCfg
+    name: Optional[str] = None
+
+    # --- 互換用エイリアス（既存コードが self.n_heads 等を参照しても動くように） ---
+    @property
+    def d_model(self) -> int:
+        return self.cfg.d_model
+
+    @property
+    def n_heads(self) -> int:
+        return self.cfg.n_heads
+
+    @property
+    def d_head(self) -> int:
+        return self.cfg.d_head
+
+    @property
+    def rotary_dim(self) -> int:
+        return self.cfg.rotary_dim
 
     # -------- LayerNorm inside layer: params under "/transformer_layers_*/norm/{offset,scale}"
     @nn.compact
