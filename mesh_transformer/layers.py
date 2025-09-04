@@ -320,8 +320,9 @@ class TransformerLayerShard(nn.Module):
         ctxBHTD = jnp.einsum('BHTS,BHSD->BHTD', probs, vBHTD)
         # back to (B,T,D)
         ctxBTD = jnp.transpose(ctxBHTD, (0, 2, 1, 3)).reshape(B, T, D)
-        attn_out = self.o(ctxBTD)
-        return attn_out
+        out = nn.Dense(D, use_bias=False, name='o')(_to_f32(ctxBTD))
+        return out.astype(xBTD.dtype)  # ★ 残差側 dtype（通常 bf16）に合わせる
+
 
     # -------- MLP
     @nn.compact
@@ -461,10 +462,11 @@ class TransformerLayerShard(nn.Module):
 
         # Update cache at cur index: (B,H,Dh)
         cur = decode_state['cur_index']
-        k_cur = jnp.transpose(kB1HD, (1, 0, 2, 3))[0]  # (B,H,Dh)
-        v_cur = jnp.transpose(vB1HD, (1, 0, 2, 3))[0]  # (B,H,Dh)
+        k_cur = jnp.transpose(kB1HD, (1, 0, 2, 3))[0].astype(kTBHD.dtype)  # (B,H,Dh)
+        v_cur = jnp.transpose(vB1HD, (1, 0, 2, 3))[0].astype(vTBHD.dtype)  # (B,H,Dh)
         kTBHD = kTBHD.at[cur].set(k_cur)
         vTBHD = vTBHD.at[cur].set(v_cur)
+
 
         # Attention over all positions <= cur (mask future)
         # Shapes for dot:
@@ -486,6 +488,8 @@ class TransformerLayerShard(nn.Module):
         ctxB1HD = jnp.transpose(ctxBH1D, (0, 2, 1, 3))        # (B,1,H,Dh)
         ctxB1D = ctxB1HD.reshape(B, 1, D)                     # (B,1,D)
         attn_out = nn.Dense(D, use_bias=False, name='o')(_to_f32(ctxB1D))
+        attn_out = attn_out.astype(xB1D.dtype)  # ★ 残差側 dtype（通常 bf16）に合わせる
+
 
         # Residual-add for MLP
         x_after_attn = xB1D + attn_out
