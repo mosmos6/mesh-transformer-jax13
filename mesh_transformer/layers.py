@@ -199,22 +199,24 @@ class TransformerLayerShard(nn.Module):
         return self.cfg.d_head
 
     @property
+    def pe(self) -> str:
+        return self.cfg.pe
+
+    @property
+    def pe_rotary_dims(self) -> int:
+        return self.cfg.pe_rotary_dims
+
+    @property
     def rotary_dim(self) -> int:
-        return self.cfg.rotary_dim
+        # 互換エイリアス（古い呼び出し側が rotary_dim を期待しても動くように）
+        return self.cfg.pe_rotary_dims
+
 
     # -------- LayerNorm inside layer: params under "/transformer_layers_*/norm/{offset,scale}"
     @nn.compact
     def norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        d = x.shape[-1]
-        # Note: because this method is @compact, self.param creates variables under "/norm/…"
-        scale = self.param('scale', nn.initializers.ones, (d,), jnp.bfloat16)
-        offset = self.param('offset', nn.initializers.zeros, (d,), jnp.bfloat16)
-        x32 = _to_f32(x)
-        mu = jnp.mean(x32, axis=-1, keepdims=True)
-        var = jnp.mean((x32 - mu) ** 2, axis=-1, keepdims=True)
-        y = (x32 - mu) * jax.lax.rsqrt(var + jnp.array(1e-6, x32.dtype))
-        y = y * _to_f32(scale) + _to_f32(offset)
-        return _to_out_dtype(x, y)
+        return ReplicatedLayerNorm(name='norm')(x)
+
 
     # -------- Full attention (prefix)
     @nn.compact
@@ -223,9 +225,9 @@ class TransformerLayerShard(nn.Module):
         H, Dh = self.n_heads, self.d_head
         assert D == H * Dh, "d_model must equal n_heads * d_head"
 
-        q = DenseNoBias(D, name='q')(xBTD)
-        k = DenseNoBias(D, name='k')(xBTD)
-        v = DenseNoBias(D, name='v')(xBTD)
+        q = DenseNoBias(D, name='q')(_to_f32(xBTD))
+        k = DenseNoBias(D, name='k')(_to_f32(xBTD))
+        v = DenseNoBias(D, name='v')(_to_f32(xBTD))
 
         # Reshape to (B,T,H,Dh)
         def to_BTHD(z):
@@ -289,9 +291,9 @@ class TransformerLayerShard(nn.Module):
         assert D == H * Dh
 
         # Project new q, k, v
-        q = DenseNoBias(D, name='q')(xB1D)            # (B,1,D)
-        k_new = DenseNoBias(D, name='k')(xB1D)        # (B,1,D)
-        v_new = DenseNoBias(D, name='v')(xB1D)        # (B,1,D)
+        q = DenseNoBias(D, name='q')(_to_f32(xB1D))            # (B,1,D)
+        k_new = DenseNoBias(D, name='k')(_to_f32(xB1D))        # (B,1,D)
+        v_new = DenseNoBias(D, name='v')(_to_f32(xB1D))        # (B,1,D)
 
         # reshape to (B,1,H,Dh)
         qB1HD = q.reshape(B, 1, H, Dh)
@@ -371,6 +373,6 @@ class ProjectionShard(nn.Module):
     def __call__(self, xBTD: jnp.ndarray) -> jnp.ndarray:
         # optional LN (params under /proj/ReplicatedLayerNorm_0)
         xn = ReplicatedLayerNorm(name='ReplicatedLayerNorm_0')(xBTD)
-        logits = DenseBias(self.n_vocab, name='Dense_0')(_to_f32(xn))
+        logits = nn.Dense(self.n_vocab, use_bias=True, name='Dense_0')(_to_f32(xn))
         # return logits in float32 for numerical stability of softmax
         return logits.astype(jnp.float32)
