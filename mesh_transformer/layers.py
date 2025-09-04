@@ -226,13 +226,7 @@ class TransformerLayerShard(nn.Module):
         # 互換エイリアス（古い呼び出し側が rotary_dim を期待しても動くように）
         return self.cfg.pe_rotary_dims
 
-    @property
-    def pe(self) -> str:
-        return self.cfg.pe
-    
-    @property
-    def pe_rotary_dims(self) -> int:
-        return self.cfg.pe_rotary_dims
+
 
 
 
@@ -307,6 +301,60 @@ class TransformerLayerShard(nn.Module):
         y = nn.Dense(D, use_bias=True, name='dense_proj_o')(_to_f32(h))
         return _to_out_dtype(xBTD, y)
 
+    # -------- KV-cache initializer (state dict: {"k": TBHD, "v": TBHD, "cur_index": int32})
+    # 注意: ここは @nn.compact を付けない（パラメタ生成が不要なため）
+    def init_decode_state(
+        self,
+        total_len: int,
+        batch: int,
+        *,
+        start_index: Optional[int] = None,
+        dtype = jnp.bfloat16,
+    ) -> Dict[str, jnp.ndarray]:
+        """KV キャッシュをゼロ初期化する。
+        返す dict 仕様:
+          - "k": (T, B, H, Dh)  bfloat16
+          - "v": (T, B, H, Dh)  bfloat16
+          - "cur_index": int32 スカラー（デコード済みの最後の位置。未設定なら -1）
+        """
+        H, Dh = self.n_heads, self.d_head
+        kTBHD = jnp.zeros((total_len, batch, H, Dh), dtype=dtype)
+        vTBHD = jnp.zeros((total_len, batch, H, Dh), dtype=dtype)
+        start = -1 if start_index is None else int(start_index)
+        cur = jnp.array(start, dtype=jnp.int32)
+        return {"k": kTBHD, "v": vTBHD, "cur_index": cur}
+
+
+        # -------- K/V projection for prefix fill (returns TBHD)
+    @nn.compact
+    def kv_for_prefix(self, xBTD: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """prefix T 分の K/V を一括で計算して返す（RoPE は K のみに適用）。
+        戻り値: (kTBHD, vTBHD) = ((T,B,H,Dh),(T,B,H,Dh)) いずれも bfloat16
+        """
+        B, T, D = xBTD.shape
+        H, Dh = self.n_heads, self.d_head
+        assert D == H * Dh, "d_model must equal n_heads * d_head"
+
+        k = nn.Dense(D, use_bias=False, name='k')(_to_f32(xBTD))
+        v = nn.Dense(D, use_bias=False, name='v')(_to_f32(xBTD))
+
+        kBTHD = k.reshape(B, T, H, Dh)
+        vBTHD = v.reshape(B, T, H, Dh)
+
+        if self.pe == 'rotary' and self.pe_rotary_dims > 0:
+            inv = _rope_freqs(self.pe_rotary_dims, dtype=jnp.float32)
+            t_idx = jnp.arange(T, dtype=jnp.float32)
+            cos, sin = _rope_angles(t_idx, inv)  # (T, half)
+            cos = cos[None, :, None, :]  # (1,T,1,half)
+            sin = sin[None, :, None, :]  # (1,T,1,half)
+            kBTHD = _apply_rope(_to_f32(kBTHD), cos, sin, self.pe_rotary_dims)
+
+        # TBHD へ並び替え（キャッシュと同じ軸順）
+        kTBHD = jnp.transpose(kBTHD, (1, 0, 2, 3)).astype(jnp.bfloat16)
+        vTBHD = jnp.transpose(vBTHD, (1, 0, 2, 3)).astype(jnp.bfloat16)
+        return kTBHD, vTBHD
+
+    
     # -------- One-step decode using KV cache (state dict: {"k": TBHD, "v": TBHD, "cur_index": int32})
     @nn.compact
     def decode_once(self, decode_state: Dict[str, jnp.ndarray], xB1D: jnp.ndarray, attn_bias: Optional[jnp.ndarray] = None
