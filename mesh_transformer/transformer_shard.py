@@ -118,11 +118,11 @@ class _CausalTransformerCore(nn.Module):
         return logits_last, (last_tok, tuple(states), rng)
 
     def _tap_state(tag, st):
-    k = st[0]['k']; v = st[0]['v']; ci = st[0].get('cur_index', None)
-    jax.debug.print(
-        "[{t}] k {ks}, v {vs}, cur_index {ci}", t=tag,
-        ks=k.shape, vs=v.shape, ci=ci if ci is not None else jnp.array(-1, jnp.int32)
-    )
+        k = st[0]['k']; v = st[0]['v']; ci = st[0].get('cur_index', None)
+        jax.debug.print(
+            "[{t}] k {ks}, v {vs}, cur_index {ci}", t=tag,
+            ks=k.shape, vs=v.shape, ci=ci if ci is not None else jnp.array(-1, jnp.int32)
+        )
 
     # After jit_init:
     jax.debug.callback(lambda st: _tap_state("init", st), state)
