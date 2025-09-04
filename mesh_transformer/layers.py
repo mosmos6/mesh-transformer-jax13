@@ -277,9 +277,10 @@ class TransformerLayerShard(nn.Module):
         H, Dh = self.n_heads, self.d_head
         assert D == H * Dh, "d_model must equal n_heads * d_head"
 
-        q = self.q(xBTD)  # (B,T,D)
-        k = self.k(xBTD)
-        v = self.v(xBTD)
+        q = self.q(_to_f32(xBTD))  # (B,T,D)
+        k = self.k(_to_f32(xBTD))
+        v = self.v(_to_f32(xBTD))
+
 
         # Reshape to (B,T,H,Dh)
         def to_BTHD(z):
