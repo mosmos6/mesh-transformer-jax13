@@ -120,9 +120,7 @@ class CausalTransformerShard(nn.Module):
         rng = jax.random.PRNGKey(0)          # 生成側の契約維持（未使用でも形は返す）
         return logitsB1V, (last_tokB, tuple(states), rng)
 
-    jax.debug.print(
-    "[kv] shapes k:{k} v:{v} cur:{c}",
-    k=state[0]['k'].shape, v=state[0]['v'].shape, c=state[0]['cur_index'])
+
 
 
     # -------------------------------------------------------------------------
