@@ -19,6 +19,19 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+# ---- debug: print dtype once (jit trace 時に1回だけ) ----
+DEBUG_DTYPE_ONCE = True
+_DEBUG_PRINTED = set()
+
+def _print_once(tag: str, **xs):
+    # jax.debug.print は JIT 内でも出る。ここは trace 時に1回だけ呼ぶ。
+    if DEBUG_DTYPE_ONCE and tag not in _DEBUG_PRINTED:
+        jax.debug.print(
+            "[{t}] " + ", ".join([f"{k}:{{{k}}}" for k in xs.keys()]),
+            t=tag, **{k: v.dtype for k, v in xs.items()}
+        )
+        _DEBUG_PRINTED.add(tag)
+
 
 # --------------------------
 # Small helpers
@@ -198,6 +211,18 @@ class TransformerLayerShard(nn.Module):
       - decode_once(decode_state, xB1D, attn_bias) -> (deltaB1D, new_state)
     """
     cfg: LayerCfg
+
+    def setup(self):
+        # ここで一度だけ submodule を作る。名前は leafspec に 100% 合わせる。
+        D = self.cfg.d_model
+        self.pre_ln   = _PreLayerNorm(name='norm')             # /transformer_layers_i/norm/{scale,offset}
+        self.q_proj   = nn.Dense(D, use_bias=False, name='q')  # /transformer_layers_i/q/Dense_0/{kernel}
+        self.k_proj   = nn.Dense(D, use_bias=False, name='k')  # /transformer_layers_i/k/Dense_0/{kernel}
+        self.v_proj   = nn.Dense(D, use_bias=False, name='v')  # /transformer_layers_i/v/Dense_0/{kernel}
+        self.o_proj   = nn.Dense(D, use_bias=False, name='o')  # /transformer_layers_i/o/Dense_0/{kernel}
+        self.w1       = nn.Dense(4 * D, use_bias=True,  name='dense_proj')    # /transformer_layers_i/dense_proj/Dense_0/{kernel,bias}
+        self.w2       = nn.Dense(D,     use_bias=True,  name='dense_proj_o')  # /transformer_layers_i/dense_proj_o/Dense_0/{kernel,bias}
+
     
 
     # --- 互換用エイリアス（既存コードが self.n_heads 等を参照しても動くように） ---
@@ -231,9 +256,10 @@ class TransformerLayerShard(nn.Module):
 
 
     # -------- LayerNorm inside layer: params under "/transformer_layers_*/norm/{offset,scale}"
-    @nn.compact
+    # compact は不要（setup() で pre_ln を作ってある）
     def norm(self, x: jnp.ndarray) -> jnp.ndarray:
-        return _PreLayerNorm(name='norm')(x)
+        return self.pre_ln(x)
+
 
     # --- 投影を公開（transformer_shard が直接呼べるように） ---
     @nn.compact
@@ -277,72 +303,67 @@ class TransformerLayerShard(nn.Module):
         H, Dh = self.n_heads, self.d_head
         assert D == H * Dh, "d_model must equal n_heads * d_head"
 
-        q = self.q(_to_f32(xBTD))  # (B,T,D)
-        k = self.k(_to_f32(xBTD))
-        v = self.v(_to_f32(xBTD))
+        # 既存パラメータを再利用（new しない）
+        q = self.q_proj(_to_f32(xBTD))  # (B,T,D)
+        k = self.k_proj(_to_f32(xBTD))
+        v = self.v_proj(_to_f32(xBTD))
 
-
-        # Reshape to (B,T,H,Dh)
-        def to_BTHD(z):
-            return z.reshape(B, T, H, Dh)
-
-        qBTHD = to_BTHD(q)
-        kBTHD = to_BTHD(k)
-        vBTHD = to_BTHD(v)
+        # (B,T,D) -> (B,T,H,Dh)
+        def to_BTHD(z): return z.reshape(B, T, H, Dh)
+        qBTHD, kBTHD, vBTHD = to_BTHD(q), to_BTHD(k), to_BTHD(v)
 
         # Rotary (prefix)
         if self.pe == 'rotary' and self.pe_rotary_dims > 0:
             inv = _rope_freqs(self.pe_rotary_dims, dtype=jnp.float32)
             t_idx = jnp.arange(T, dtype=jnp.float32)
             cos, sin = _rope_angles(t_idx, inv)  # (T, half)
-            # reshape to (1,T,1,half)
             cos = cos[None, :, None, :]
             sin = sin[None, :, None, :]
-            q_rot = _apply_rope(_to_f32(qBTHD), cos, sin, self.pe_rotary_dims)
-            k_rot = _apply_rope(_to_f32(kBTHD), cos, sin, self.pe_rotary_dims)
+            q_rot = _apply_rope(qBTHD.astype(jnp.float32), cos, sin, self.pe_rotary_dims)
+            k_rot = _apply_rope(kBTHD.astype(jnp.float32), cos, sin, self.pe_rotary_dims)
         else:
-            q_rot = _to_f32(qBTHD)
-            k_rot = _to_f32(kBTHD)
+            q_rot = qBTHD.astype(jnp.float32)
+            k_rot = kBTHD.astype(jnp.float32)
 
-        # Scores: (B,H,T,T)
         # (B,T,H,Dh) -> (B,H,T,Dh)
         qBHtD = jnp.transpose(q_rot, (0, 2, 1, 3))
         kBHTD = jnp.transpose(k_rot, (0, 2, 1, 3))
-        # scale
+        vBHTD = jnp.transpose(vBTHD.astype(jnp.float32), (0, 2, 1, 3))
+
         scale = jnp.array(1.0 / math.sqrt(Dh), dtype=jnp.float32)
-        scores = jnp.einsum('BHTD,BHSD->BHTS', qBHtD, kBHTD) * scale
+        scores = jnp.einsum('BHTD,BHSD->BHTS', qBHtD, kBHTD) * scale  # (B,H,T,T)
+
+        # debug dtype (一度だけ)
+        _print_once("attn", q=qBHtD, k=kBHTD, v=vBHTD, scores=scores)
+
         # causal mask
         m = jnp.tril(jnp.ones((T, T), dtype=bool))
         scores = jnp.where(m[None, None, :, :], scores, jnp.full_like(scores, -1e9, dtype=scores.dtype))
         probs = jax.nn.softmax(scores, axis=-1)
 
-        vBHTD = jnp.transpose(_to_f32(vBTHD), (0, 2, 1, 3))
-        ctxBHTD = jnp.einsum('BHTS,BHSD->BHTD', probs, vBHTD)
-        # back to (B,T,D)
-        ctxBTD = jnp.transpose(ctxBHTD, (0, 2, 1, 3)).reshape(B, T, D)
-        out = nn.Dense(D, use_bias=False, name='o')(_to_f32(ctxBTD))
-        return out.astype(xBTD.dtype)  # ★ 残差側 dtype（通常 bf16）に合わせる
+        ctxBHTD = jnp.einsum('BHTS,BHSD->BHTD', probs, vBHTD)      # (B,H,T,Dh)
+        ctxBTD  = jnp.transpose(ctxBHTD, (0, 2, 1, 3)).reshape(B,T,D)  # (B,T,D)
+
+        # ここも既存の O を使う（new しない）
+        out = self.o_proj(ctxBTD.astype(jnp.float32))
+        return out.astype(xBTD.dtype)  # 残差 dtype に合わせる（通常 bf16）
+
 
 
     # -------- MLP
     @nn.compact
     def mlp_block(self, xBTD: jnp.ndarray) -> jnp.ndarray:
-        D = xBTD.shape[-1]
-        hidden = 4 * D
-        # Dense -> GELU -> Dense ; all math in f32
-        h = nn.Dense(hidden, use_bias=True, name='dense_proj')(_to_f32(xBTD))
-        h = _gelu(h)
-        y = nn.Dense(D, use_bias=True, name='dense_proj_o')(_to_f32(h))
-        return _to_out_dtype(xBTD, y)
+        x32 = _to_f32(xBTD)
+        h = self.w1(x32)     # FP32
+        h = _gelu(h)         # FP32
+        y = self.w2(h)       # FP32
 
-    # --- KV 初期化（TBHD: (T, B, H, Dh)） ---
-    
-    def init_decode_state(self, total_len: int, batch: int) -> Dict[str, jnp.ndarray]:
-        H, Dh = self.n_heads, self.d_head
-        k = jnp.zeros((total_len, batch, H, Dh), dtype=jnp.bfloat16)
-        v = jnp.zeros((total_len, batch, H, Dh), dtype=jnp.bfloat16)
-        cur = jnp.array(0, dtype=jnp.int32)
-        return {"k": k, "v": v, "cur_index": cur}
+        _print_once("ffn", x=x32, w1_out=h, w2_out=y)
+
+        return _to_out_dtype(xBTD, y)  # 出力だけ bf16 に戻す
+
+
+
 
     # --- prefix の K/V を一括生成（RoPE 済み） ---
     @nn.compact
@@ -392,109 +413,108 @@ class TransformerLayerShard(nn.Module):
         return {"k": kTBHD, "v": vTBHD, "cur_index": cur}
 
 
-        # -------- K/V projection for prefix fill (returns TBHD)
+    # -------- K/V projection for prefix fill (returns TBHD)
     @nn.compact
     def kv_for_prefix(self, xBTD: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """prefix T 分の K/V を一括で計算して返す（RoPE は K のみに適用）。
-        戻り値: (kTBHD, vTBHD) = ((T,B,H,Dh),(T,B,H,Dh)) いずれも bfloat16
+        """prefix T 分の K/V を一括計算して返す（RoPE は K のみに適用）。
+        戻り値: (kTBHD, vTBHD) = ((T,B,H,Dh),(T,B,H,Dh))
         """
         B, T, D = xBTD.shape
         H, Dh = self.n_heads, self.d_head
-        assert D == H * Dh, "d_model must equal n_heads * d_head"
+        assert D == H * Dh
 
-        k = nn.Dense(D, use_bias=False, name='k')(_to_f32(xBTD))
-        v = nn.Dense(D, use_bias=False, name='v')(_to_f32(xBTD))
-
+        k = self.k_proj(_to_f32(xBTD))
+        v = self.v_proj(_to_f32(xBTD))
         kBTHD = k.reshape(B, T, H, Dh)
         vBTHD = v.reshape(B, T, H, Dh)
 
         if self.pe == 'rotary' and self.pe_rotary_dims > 0:
             inv = _rope_freqs(self.pe_rotary_dims, dtype=jnp.float32)
             t_idx = jnp.arange(T, dtype=jnp.float32)
-            cos, sin = _rope_angles(t_idx, inv)  # (T, half)
-            cos = cos[None, :, None, :]  # (1,T,1,half)
-            sin = sin[None, :, None, :]  # (1,T,1,half)
-            kBTHD = _apply_rope(_to_f32(kBTHD), cos, sin, self.pe_rotary_dims)
+            cos, sin = _rope_angles(t_idx, inv)
+            cos = cos[None, :, None, :]
+            sin = sin[None, :, None, :]
+            kBTHD = _apply_rope(kBTHD.astype(jnp.float32), cos, sin, self.pe_rotary_dims)
 
-        # TBHD へ並び替え（キャッシュと同じ軸順）
         kTBHD = jnp.transpose(kBTHD, (1, 0, 2, 3)).astype(jnp.bfloat16)
         vTBHD = jnp.transpose(vBTHD, (1, 0, 2, 3)).astype(jnp.bfloat16)
         return kTBHD, vTBHD
 
+
     
     # -------- One-step decode using KV cache (state dict: {"k": TBHD, "v": TBHD, "cur_index": int32})
     @nn.compact
-    def decode_once(self, decode_state: Dict[str, jnp.ndarray], xB1D: jnp.ndarray, attn_bias: Optional[jnp.ndarray] = None
-                   ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-        # xB1D: (B,1,D)
+    def decode_once(
+        self,
+        decode_state: Dict[str, jnp.ndarray],
+        xB1D: jnp.ndarray,
+        attn_bias: Optional[jnp.ndarray] = None
+    ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
         B, one, D = xB1D.shape
         H, Dh = self.n_heads, self.d_head
         assert D == H * Dh
 
-        # Project new q, k, v
-        q = nn.Dense(D, use_bias=False, name='q')(_to_f32(xB1D))
-        k_new = nn.Dense(D, use_bias=False, name='k')(_to_f32(xB1D))
-        v_new = nn.Dense(D, use_bias=False, name='v')(_to_f32(xB1D))
+        # Q/K/V（既存パラメータを使う）
+        q = self.q_proj(_to_f32(xB1D))   # (B,1,D)
+        k_new = self.k_proj(_to_f32(xB1D))
+        v_new = self.v_proj(_to_f32(xB1D))
 
-        # reshape to (B,1,H,Dh)
         qB1HD = q.reshape(B, 1, H, Dh)
         kB1HD = k_new.reshape(B, 1, H, Dh)
         vB1HD = v_new.reshape(B, 1, H, Dh)
 
-        # Apply RoPE at the current index
+        # RoPE 単ステップ（pos=cur_index）
+        cur = decode_state['cur_index']
         if self.pe == 'rotary' and self.pe_rotary_dims > 0:
             inv = _rope_freqs(self.pe_rotary_dims, dtype=jnp.float32)
-            cur = decode_state['cur_index']  # int32[] tracer-friendly
-            cur_f = cur.astype(jnp.float32)
-            cos, sin = _rope_angles(cur_f[None], inv)  # (1, half)
+            cos, sin = _rope_angles(cur.astype(jnp.float32)[None], inv)  # (1, half)
             cos = cos[None, :, None, :]  # (1,1,1,half)
-            sin = sin[None, :, None, :]  # (1,1,1,half)
-            qB1HD = _apply_rope(_to_f32(qB1HD), cos, sin, self.pe_rotary_dims)
-            kB1HD = _apply_rope(_to_f32(kB1HD), cos, sin, self.pe_rotary_dims)
+            sin = sin[None, :, None, :]
+            qB1HD = _apply_rope(qB1HD.astype(jnp.float32), cos, sin, self.pe_rotary_dims)
+            kB1HD = _apply_rope(kB1HD.astype(jnp.float32), cos, sin, self.pe_rotary_dims)
         else:
-            qB1HD = _to_f32(qB1HD)
-            kB1HD = _to_f32(kB1HD)
+            qB1HD = qB1HD.astype(jnp.float32)
+            kB1HD = kB1HD.astype(jnp.float32)
 
-        # Read cache (T, B, H, Dh)
+        # 既存キャッシュ（TBHD）
         kTBHD = decode_state['k']
         vTBHD = decode_state['v']
-        Tcache = kTBHD.shape[0]
+        Tcache, Bc, Hc, Dhc = kTBHD.shape
+        assert Bc == B and Hc == H and Dhc == Dh
 
-        # Update cache at cur index: (B,H,Dh)
-        cur = decode_state['cur_index']
-        k_cur = jnp.transpose(kB1HD, (1, 0, 2, 3))[0].astype(kTBHD.dtype)  # (B,H,Dh)
-        v_cur = jnp.transpose(vB1HD, (1, 0, 2, 3))[0].astype(vTBHD.dtype)  # (B,H,Dh)
+        # cur 位置へ書き込み（dtype を合わせて set）
+        k_cur = jnp.transpose(kB1HD, (1, 0, 2, 3))[0].astype(kTBHD.dtype)
+        v_cur = jnp.transpose(vB1HD, (1, 0, 2, 3))[0].astype(vTBHD.dtype)
         kTBHD = kTBHD.at[cur].set(k_cur)
         vTBHD = vTBHD.at[cur].set(v_cur)
 
-
-        # Attention over all positions <= cur (mask future)
-        # Shapes for dot:
-        #   q: (B,H,1,Dh)
-        #   k: (B,H,T,Dh)
+        # (B,H,1,Dh) × (B,H,T,Dh)
         qBH1D = jnp.transpose(qB1HD, (0, 2, 1, 3))
-        kBHTD = jnp.transpose(_to_f32(kTBHD), (1, 2, 0, 3))
-        vBHTD = jnp.transpose(_to_f32(vTBHD), (1, 2, 0, 3))
+        kBHTD = jnp.transpose(kTBHD.astype(jnp.float32), (1, 2, 0, 3))
+        vBHTD = jnp.transpose(vTBHD.astype(jnp.float32), (1, 2, 0, 3))
 
         scale = jnp.array(1.0 / math.sqrt(Dh), dtype=jnp.float32)
         scores = jnp.einsum('BH1D,BHTD->BH1T', qBH1D, kBHTD) * scale  # (B,H,1,T)
-        # causal mask with current index
-        idx = jnp.arange(Tcache, dtype=cur.dtype)  # (T,)
+
+        _print_once("attn_step", q=qBH1D, k=kBHTD, v=vBHTD, scores=scores)
+
+        # 未来を無効化（<= cur のみ許可）
+        idx = jnp.arange(Tcache, dtype=cur.dtype)
         mask = idx[None, None, None, :] <= cur[None, None, None]
         scores = jnp.where(mask, scores, jnp.full_like(scores, -1e9, dtype=scores.dtype))
-        probs = jax.nn.softmax(scores, axis=-1)  # (B,H,1,T)
+        probs = jax.nn.softmax(scores, axis=-1)
 
-        ctxBH1D = jnp.einsum('BH1T,BHTD->BH1D', probs, vBHTD)  # (B,H,1,Dh)
-        ctxB1HD = jnp.transpose(ctxBH1D, (0, 2, 1, 3))        # (B,1,H,Dh)
-        ctxB1D = ctxB1HD.reshape(B, 1, D)                     # (B,1,D)
-        attn_out = nn.Dense(D, use_bias=False, name='o')(_to_f32(ctxB1D))
-        attn_out = attn_out.astype(xB1D.dtype)  # ★ 残差側 dtype（通常 bf16）に合わせる
+        ctxBH1D = jnp.einsum('BH1T,BHTD->BH1D', probs, vBHTD)
+        ctxB1HD = jnp.transpose(ctxBH1D, (0, 2, 1, 3))
+        ctxB1D  = ctxB1HD.reshape(B, 1, D)
 
+        # 既存 O を使用（new しない）
+        attn_out = self.o_proj(ctxB1D.astype(jnp.float32)).astype(xB1D.dtype)
 
-        # Residual-add for MLP
+        # FFN（pre-LN → FFN）
         x_after_attn = xB1D + attn_out
         xn2 = self.norm(x_after_attn)
-        ff = self.mlp_block(xn2)
+        ff  = self.mlp_block(xn2)
 
         delta_total = attn_out + ff
         new_state = {
@@ -503,6 +523,7 @@ class TransformerLayerShard(nn.Module):
             'cur_index': cur + jnp.array(1, dtype=cur.dtype),
         }
         return delta_total, new_state
+
 
 
 # --------------------------
