@@ -152,6 +152,10 @@ class CausalTransformerShard(nn.Module):
         logitsB1V = self.proj(x)  # float32
         return logitsB1V, (new_tok_B, tuple(new_states), rng)
 
+        # 例: 1 回だけ
+        jax.debug.print("[kv] cur:{c} k0:{k} v0:{v}", c=new_states[0]['cur_index'], k=new_states[0]['k'].shape, v=new_states[0]['v'].shape)
+
+
 
 # -----------------------------------------------------------------------------
 # ユーザーフレンドリなラッパ（shard_map を保持しつつ単一コアにも対応）
