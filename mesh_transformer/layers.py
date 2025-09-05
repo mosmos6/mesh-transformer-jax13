@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 # ---- debug: print dtype once (jit trace 時に1回だけ) ----
-DEBUG_DTYPE_ONCE = True
+DEBUG_DTYPE_ONCE = False
 _DEBUG_PRINTED = set()
 
 def _print_once(tag: str, **xs):
@@ -334,7 +334,7 @@ class TransformerLayerShard(nn.Module):
         scores = jnp.einsum('BHTD,BHSD->BHTS', qBHtD, kBHTD) * scale  # (B,H,T,T)
 
         # debug dtype (一度だけ)
-        _print_once("attn", q=qBHtD, k=kBHTD, v=vBHTD, scores=scores)
+        #_print_once("attn", q=qBHtD, k=kBHTD, v=vBHTD, scores=scores)
 
         # causal mask
         m = jnp.tril(jnp.ones((T, T), dtype=bool))
@@ -454,28 +454,30 @@ class TransformerLayerShard(nn.Module):
         H, Dh = self.n_heads, self.d_head
         assert D == H * Dh
 
-        # Q/K/V（既存パラメータを使う）
-        q = self.q_proj(_to_f32(xB1D))   # (B,1,D)
-        k_new = self.k_proj(_to_f32(xB1D))
-        v_new = self.v_proj(_to_f32(xB1D))
+        # --- pre-LN -> Q/K/V（prefix と一致させる）---
+        xn1 = self.norm(xB1D)  # (B,1,D), params under /transformer_layers_*/norm
+        q = self.q_proj(_to_f32(xn1))    # (B,1,D)
+        k_new = self.k_proj(_to_f32(xn1))
+        v_new = self.v_proj(_to_f32(xn1))
 
         qB1HD = q.reshape(B, 1, H, Dh)
         kB1HD = k_new.reshape(B, 1, H, Dh)
         vB1HD = v_new.reshape(B, 1, H, Dh)
 
         # RoPE 単ステップ（pos=cur_index）
-        cur = decode_state['cur_index']
-        write_idx = cur + jnp.array(1, dtype=cur.dtype)
+        cur = decode_state['cur_index']          # 現在の書き込み位置（prefix T のとき T）
+        pos_f = cur.astype(jnp.float32)          # RoPE 位置 = cur
         if self.pe == 'rotary' and self.pe_rotary_dims > 0:
             inv = _rope_freqs(self.pe_rotary_dims, dtype=jnp.float32)
-            cos, sin = _rope_angles(cur.astype(jnp.float32)[None], inv)  # (1, half)
+            cos, sin = _rope_angles(pos_f[None], inv)   # (1, half)
             cos = cos[None, :, None, :]  # (1,1,1,half)
-            sin = sin[None, :, None, :]
+            sin = sin[None, :, None, :]  # (1,1,1,half)
             qB1HD = _apply_rope(qB1HD.astype(jnp.float32), cos, sin, self.pe_rotary_dims)
             kB1HD = _apply_rope(kB1HD.astype(jnp.float32), cos, sin, self.pe_rotary_dims)
         else:
             qB1HD = qB1HD.astype(jnp.float32)
             kB1HD = kB1HD.astype(jnp.float32)
+
 
         # 既存キャッシュ（TBHD）
         kTBHD = decode_state['k']
