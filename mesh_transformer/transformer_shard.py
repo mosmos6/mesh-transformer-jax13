@@ -111,8 +111,10 @@ class CausalTransformerShard(nn.Module):
             k_all = k_all.at[:T].set(kTBHD)
             v_all = v_all.at[:T].set(vTBHD)
             # 次に書き込む位置（= prefix 長）
-            cur = jnp.array(T, dtype=jnp.int32)
+            # 「最後に埋まっている位置」を cur_index にする（prefix 長 T のとき T-1）
+            cur = jnp.array(T - 1, dtype=jnp.int32)
             states.append({"k": k_all, "v": v_all, "cur_index": cur})
+
 
         # 最終トークン位置のロジット (B,1,V) を返す（float32）
         logitsB1V = self.proj(x[:, -1:, :])  # (B,1,V) float32
