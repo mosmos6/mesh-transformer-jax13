@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 # ---- debug: print dtype once (jit trace 時に1回だけ) ----
-DEBUG_DTYPE_ONCE = False
+DEBUG_DTYPE_ONCE = True
 _DEBUG_PRINTED = set()
 
 def _print_once(tag: str, **xs):
