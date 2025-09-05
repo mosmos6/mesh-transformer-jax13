@@ -443,6 +443,7 @@ class TransformerLayerShard(nn.Module):
 
     
     # -------- One-step decode using KV cache (state dict: {"k": TBHD, "v": TBHD, "cur_index": int32})
+    # -------- One-step decode using KV cache ...
     @nn.compact
     def decode_once(
         self,
@@ -453,81 +454,75 @@ class TransformerLayerShard(nn.Module):
         B, one, D = xB1D.shape
         H, Dh = self.n_heads, self.d_head
         assert D == H * Dh
-
-        # --- pre-LN -> Q/K/V（prefix と一致させる）---
-        # ★ pre-LN を decode でも必ず通す（prefix と一致させる）
-        xn = self.norm(xB1D)
-        q = self.q_proj(_to_f32(xn))   # (B,1,D)
+    
+        # ★ pre-LN → Q/K/V （prefix と同じ流儀に揃える）
+        xn = self.norm(xB1D)                       # (B,1,D)  pre-LN
+        q = self.q_proj(_to_f32(xn))               # (B,1,D)
         k_new = self.k_proj(_to_f32(xn))
         v_new = self.v_proj(_to_f32(xn))
-
-
+    
         qB1HD = q.reshape(B, 1, H, Dh)
         kB1HD = k_new.reshape(B, 1, H, Dh)
         vB1HD = v_new.reshape(B, 1, H, Dh)
-
-        # RoPE 単ステップ（pos=cur_index）
-        cur = decode_state['cur_index']          # 現在の書き込み位置（prefix T のとき T）
-        pos_f = cur.astype(jnp.float32)          # RoPE 位置 = cur
+    
+        # 既存キャッシュ
+        kTBHD = decode_state['k']
+        vTBHD = decode_state['v']
+        cur   = decode_state['cur_index']          # 「最後に埋まっている位置」(prefix 直後は T-1)
+        write_idx = cur + jnp.array(1, dtype=cur.dtype)  # 次に書く位置
+    
+        # RoPE 単ステップ（pos = write_idx）
         if self.pe == 'rotary' and self.pe_rotary_dims > 0:
             inv = _rope_freqs(self.pe_rotary_dims, dtype=jnp.float32)
-            cos, sin = _rope_angles(pos_f[None], inv)   # (1, half)
+            pos_f = write_idx.astype(jnp.float32)
+            cos, sin = _rope_angles(pos_f[None], inv)  # (1, half)
             cos = cos[None, :, None, :]  # (1,1,1,half)
-            sin = sin[None, :, None, :]  # (1,1,1,half)
+            sin = sin[None, :, None, :]
             qB1HD = _apply_rope(qB1HD.astype(jnp.float32), cos, sin, self.pe_rotary_dims)
             kB1HD = _apply_rope(kB1HD.astype(jnp.float32), cos, sin, self.pe_rotary_dims)
         else:
             qB1HD = qB1HD.astype(jnp.float32)
             kB1HD = kB1HD.astype(jnp.float32)
-
-
-        # 既存キャッシュ（TBHD）
-        kTBHD = decode_state['k']
-        vTBHD = decode_state['v']
-        Tcache, Bc, Hc, Dhc = kTBHD.shape
-        assert Bc == B and Hc == H and Dhc == Dh
-
-        # cur 位置へ書き込み（dtype を合わせて set）
-        k_cur = jnp.transpose(kB1HD, (1, 0, 2, 3))[0].astype(kTBHD.dtype)
+    
+        # write_idx に K/V を書く（TBHD）
+        k_cur = jnp.transpose(kB1HD, (1, 0, 2, 3))[0].astype(kTBHD.dtype)  # (B,H,Dh)
         v_cur = jnp.transpose(vB1HD, (1, 0, 2, 3))[0].astype(vTBHD.dtype)
-        kTBHD = kTBHD.at[cur].set(k_cur)
-        vTBHD = vTBHD.at[cur].set(v_cur)
-
-        # (B,H,1,Dh) × (B,H,T,Dh)
-        qBH1D = jnp.transpose(qB1HD, (0, 2, 1, 3))
-        kBHTD = jnp.transpose(kTBHD.astype(jnp.float32), (1, 2, 0, 3))
-        vBHTD = jnp.transpose(vTBHD.astype(jnp.float32), (1, 2, 0, 3))
-
-        scale = jnp.array(1.0 / math.sqrt(Dh), dtype=jnp.float32)
-        scores = jnp.einsum('BH1D,BHTD->BH1T', qBH1D, kBHTD) * scale  # (B,H,1,T)
-
-        _print_once("attn_step", q=qBH1D, k=kBHTD, v=vBHTD, scores=scores)
-
-        # 未来を無効化（<= cur のみ許可）
-        idx = jnp.arange(Tcache, dtype=cur.dtype)
-        mask = idx[None, None, None, :] <= cur[None, None, None]
+        kTBHD = kTBHD.at[write_idx].set(k_cur)
+        vTBHD = vTBHD.at[write_idx].set(v_cur)
+    
+        # 注意：この step の attend は keys ≤ write_idx を許可
+        Tcache = kTBHD.shape[0]
+        qBH1D  = jnp.transpose(qB1HD, (0, 2, 1, 3))                      # (B,H,1,Dh)
+        kBHTD  = jnp.transpose(kTBHD.astype(jnp.float32), (1, 2, 0, 3))  # (B,H,T,Dh)
+        vBHTD  = jnp.transpose(vTBHD.astype(jnp.float32), (1, 2, 0, 3))
+    
+        scale  = jnp.array(1.0 / math.sqrt(Dh), dtype=jnp.float32)
+        scores = jnp.einsum('BH1D,BHTD->BH1T', qBH1D, kBHTD) * scale      # (B,H,1,T)
+    
+        idx   = jnp.arange(Tcache, dtype=write_idx.dtype)
+        mask  = idx[None, None, None, :] <= write_idx[None, None, None]
         scores = jnp.where(mask, scores, jnp.full_like(scores, -1e9, dtype=scores.dtype))
-        probs = jax.nn.softmax(scores, axis=-1)
-
+        probs  = jax.nn.softmax(scores, axis=-1)
+    
         ctxBH1D = jnp.einsum('BH1T,BHTD->BH1D', probs, vBHTD)
         ctxB1HD = jnp.transpose(ctxBH1D, (0, 2, 1, 3))
         ctxB1D  = ctxB1HD.reshape(B, 1, D)
-
-        # 既存 O を使用（new しない）
+    
         attn_out = self.o_proj(ctxB1D.astype(jnp.float32)).astype(xB1D.dtype)
-
+    
         # FFN（pre-LN → FFN）
         x_after_attn = xB1D + attn_out
         xn2 = self.norm(x_after_attn)
         ff  = self.mlp_block(xn2)
-
+    
         delta_total = attn_out + ff
         new_state = {
             'k': kTBHD,
             'v': vTBHD,
-            'cur_index': cur + jnp.array(1, dtype=cur.dtype),
+            'cur_index': write_idx,   # 最後に埋まっている位置を更新
         }
         return delta_total, new_state
+
 
 
 
