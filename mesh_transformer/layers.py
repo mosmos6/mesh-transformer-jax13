@@ -20,7 +20,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 # ---- debug: print dtype once (jit trace 時に1回だけ) ----
-DEBUG_DTYPE_ONCE = True
+DEBUG_DTYPE_ONCE = False
 _DEBUG_PRINTED = set()
 
 def _print_once(tag: str, **xs):
@@ -455,10 +455,12 @@ class TransformerLayerShard(nn.Module):
         assert D == H * Dh
 
         # --- pre-LN -> Q/K/V（prefix と一致させる）---
-        xn1 = self.norm(xB1D)  # (B,1,D), params under /transformer_layers_*/norm
-        q = self.q_proj(_to_f32(xn1))    # (B,1,D)
-        k_new = self.k_proj(_to_f32(xn1))
-        v_new = self.v_proj(_to_f32(xn1))
+        # ★ pre-LN を decode でも必ず通す（prefix と一致させる）
+        xn = self.norm(xB1D)
+        q = self.q_proj(_to_f32(xn))   # (B,1,D)
+        k_new = self.k_proj(_to_f32(xn))
+        v_new = self.v_proj(_to_f32(xn))
+
 
         qB1HD = q.reshape(B, 1, H, Dh)
         kB1HD = k_new.reshape(B, 1, H, Dh)
