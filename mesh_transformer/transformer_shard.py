@@ -150,7 +150,7 @@ class CausalTransformerShard(nn.Module):
             new_states.append(st2)
 
         # 例: 1 回だけ
-        jax.debug.print("[kv] cur:{c} k0:{k} v0:{v}", c=new_states[0]['cur_index'], k=new_states[0]['k'].shape, v=new_states[0]['v'].shape)
+        #jax.debug.print("[kv] cur:{c} k0:{k} v0:{v}", c=new_states[0]['cur_index'], k=new_states[0]['k'].shape, v=new_states[0]['v'].shape)
                           
         logitsB1V = self.proj(x)  # float32
         return logitsB1V, (new_tok_B, tuple(new_states), rng)
